@@ -1,0 +1,501 @@
+// This file is part of Eigen, a lightweight C++ template library
+// for linear algebra.
+//
+// Copyright (C) 2006-2008 Benoit Jacob <jacob.benoit.1@gmail.com>
+//
+// This Source Code Form is subject to the terms of the Mozilla
+// Public License v. 2.0. If a copy of the MPL was not distributed
+// with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: MPL-2.0
+
+#include "main.h"
+
+// |value|, promoted so that the error bounds below accumulate in the widest available type.
+template <typename T>
+long double wide_abs(const T& value) {
+  using std::abs;
+  return static_cast<long double>(abs(value));
+}
+
+template <bool IsInteger>
+struct adjoint_specific;
+
+template <>
+struct adjoint_specific<true> {
+  template <typename Vec, typename Mat, typename Scalar>
+  static void run(const Vec& v1, const Vec& v2, Vec& v3, const Mat& square, Scalar s1, Scalar s2) {
+    VERIFY_IS_EQUAL((s1 * v1 + s2 * v2).dot(v3), numext::conj(s1) * v1.dot(v3) + numext::conj(s2) * v2.dot(v3));
+    VERIFY_IS_EQUAL(v3.dot(s1 * v1 + s2 * v2), s1 * v3.dot(v1) + s2 * v3.dot(v2));
+
+    // check compatibility of dot and adjoint
+    VERIFY_IS_EQUAL(v1.dot(square * v2), (square.adjoint() * v1).dot(v2));
+  }
+};
+
+template <>
+struct adjoint_specific<false> {
+  template <typename Vec, typename Mat, typename Scalar>
+  static void run(const Vec& v1, const Vec& v2, Vec& v3, const Mat& square, Scalar s1, Scalar s2) {
+    using RealScalar = typename NumTraits<Scalar>::Real;
+
+    const long double eps = static_cast<long double>(NumTraits<RealScalar>::epsilon());
+    const long double absS1 = wide_abs(s1), absS2 = wide_abs(s2);
+    long double linearityScale = 0;
+    for (Index i = 0; i < v1.size(); ++i)
+      linearityScale += (absS1 * wide_abs(v1(i)) + absS2 * wide_abs(v2(i))) * wide_abs(v3(i));
+    // Two evaluation orders, including complex multiply-adds and scalar-vector products.
+    const long double linearityBound = 8 * (v1.size() + 4) * eps * linearityScale;
+    VERIFY((numext::isfinite)(linearityBound));
+    VERIFY(wide_abs((s1 * v1 + s2 * v2).dot(v3) - (numext::conj(s1) * v1.dot(v3) + numext::conj(s2) * v2.dot(v3))) <=
+           linearityBound);
+    VERIFY(wide_abs(v3.dot(s1 * v1 + s2 * v2) - (s1 * v3.dot(v1) + s2 * v3.dot(v2))) <= linearityBound);
+
+    VERIFY_IS_APPROX(v1.squaredNorm(), v1.norm() * v1.norm());
+    // check normalized() and normalize()
+    VERIFY_IS_APPROX(v1, v1.norm() * v1.normalized());
+    v3 = v1;
+    v3.normalize();
+    VERIFY_IS_APPROX(v1, v1.norm() * v3);
+    VERIFY_IS_APPROX(v3, v1.normalized());
+    VERIFY_IS_APPROX(v3.norm(), RealScalar(1));
+
+    // check null inputs
+    VERIFY_IS_APPROX((v1 * 0).normalized(), (v1 * 0));
+#if (!EIGEN_ARCH_i386) || defined(EIGEN_VECTORIZE)
+    RealScalar very_small = (std::numeric_limits<RealScalar>::min)();
+    // Materialized once: ARMv7 NEON flushes the subnormal products that a coefficient-wise read of the lazy
+    // expression keeps.
+    const Vec tiny = v1 * very_small;
+    VERIFY(numext::is_exactly_zero(tiny.norm()));
+    VERIFY_IS_APPROX(tiny.normalized(), tiny);
+    v3 = tiny;
+    v3.normalize();
+    VERIFY_IS_APPROX(v3, tiny);
+#endif
+
+    // check compatibility of dot and adjoint
+    long double adjointScale = 0;
+    for (Index i = 0; i < square.rows(); ++i)
+      for (Index j = 0; j < square.cols(); ++j)
+        adjointScale += wide_abs(v1(i)) * wide_abs(square(i, j)) * wide_abs(v2(j));
+    // Each order has two reductions; allow 8*n*eps per complex product and its accumulation.
+    const long double adjointBound = 16 * (v1.size() + 1) * eps * adjointScale;
+    VERIFY((numext::isfinite)(adjointBound));
+    VERIFY(wide_abs(v1.dot(square * v2) - (square.adjoint() * v1).dot(v2)) <= adjointBound);
+
+    // check that Random().normalized() works: tricky as the random xpr must be evaluated by
+    // normalized() in order to produce a consistent result.
+    VERIFY_IS_APPROX(Vec::Random(v1.size()).normalized().norm(), RealScalar(1));
+  }
+};
+
+template <typename MatrixType>
+void adjoint(const MatrixType& m) {
+  /* this test covers the following files:
+     Transpose.h Conjugate.h Dot.h
+  */
+  using std::abs;
+  typedef typename MatrixType::Scalar Scalar;
+  typedef typename NumTraits<Scalar>::Real RealScalar;
+  typedef Matrix<Scalar, MatrixType::RowsAtCompileTime, 1> VectorType;
+  typedef Matrix<Scalar, MatrixType::RowsAtCompileTime, MatrixType::RowsAtCompileTime> SquareMatrixType;
+  const Index PacketSize = internal::packet_traits<Scalar>::size;
+
+  Index rows = m.rows();
+  Index cols = m.cols();
+
+  // Avoid integer overflow by limiting input values.
+  RealScalar rmin = static_cast<RealScalar>(NumTraits<Scalar>::IsInteger ? NumTraits<Scalar>::IsSigned ? -100 : 0 : -1);
+  RealScalar rmax = static_cast<RealScalar>(NumTraits<Scalar>::IsInteger ? 100 : 1);
+
+  MatrixType m1 = RandomMatrix<MatrixType>(rows, cols, rmin, rmax),
+             m2 = RandomMatrix<MatrixType>(rows, cols, rmin, rmax), m3(rows, cols),
+             square = RandomMatrix<SquareMatrixType>(rows, rows, rmin, rmax);
+  VectorType v1 = RandomMatrix<VectorType>(rows, 1, rmin, rmax), v2 = RandomMatrix<VectorType>(rows, 1, rmin, rmax),
+             v3 = RandomMatrix<VectorType>(rows, 1, rmin, rmax), vzero = VectorType::Zero(rows);
+
+  Scalar s1 = internal::random<Scalar>(rmin, rmax), s2 = internal::random<Scalar>(rmin, rmax);
+
+  // check basic compatibility of adjoint, transpose, conjugate
+  VERIFY_IS_APPROX(m1.transpose().conjugate().adjoint(), m1);
+  VERIFY_IS_APPROX(m1.adjoint().conjugate().transpose(), m1);
+
+  // check multiplicative behavior
+  VERIFY_IS_APPROX((m1.adjoint() * m2).adjoint(), m2.adjoint() * m1);
+  VERIFY_IS_APPROX((s1 * m1).adjoint(), numext::conj(s1) * m1.adjoint());
+
+  // check basic properties of dot, squaredNorm
+  VERIFY_IS_APPROX(numext::conj(v1.dot(v2)), v2.dot(v1));
+  VERIFY_IS_APPROX(numext::real(v1.dot(v1)), v1.squaredNorm());
+
+  adjoint_specific<NumTraits<Scalar>::IsInteger>::run(v1, v2, v3, square, s1, s2);
+
+  VERIFY_IS_MUCH_SMALLER_THAN(abs(vzero.dot(v1)), static_cast<RealScalar>(1));
+
+  // like in testBasicStuff, test operator() to check const-qualification
+  Index r = internal::random<Index>(0, rows - 1), c = internal::random<Index>(0, cols - 1);
+  VERIFY_IS_APPROX(m1.conjugate()(r, c), numext::conj(m1(r, c)));
+  VERIFY_IS_APPROX(m1.adjoint()(c, r), numext::conj(m1(r, c)));
+
+  // check inplace transpose
+  m3 = m1;
+  m3.transposeInPlace();
+  VERIFY_IS_APPROX(m3, m1.transpose());
+  m3.transposeInPlace();
+  VERIFY_IS_APPROX(m3, m1);
+
+  if (PacketSize < m3.rows() && PacketSize < m3.cols()) {
+    m3 = m1;
+    Index i = internal::random<Index>(0, m3.rows() - PacketSize);
+    Index j = internal::random<Index>(0, m3.cols() - PacketSize);
+    m3.template block<PacketSize, PacketSize>(i, j).transposeInPlace();
+    VERIFY_IS_APPROX((m3.template block<PacketSize, PacketSize>(i, j)),
+                     (m1.template block<PacketSize, PacketSize>(i, j).transpose()));
+    m3.template block<PacketSize, PacketSize>(i, j).transposeInPlace();
+    VERIFY_IS_APPROX(m3, m1);
+  }
+
+  // check inplace adjoint
+  m3 = m1;
+  m3.adjointInPlace();
+  VERIFY_IS_APPROX(m3, m1.adjoint());
+  m3.transposeInPlace();
+  VERIFY_IS_APPROX(m3, m1.conjugate());
+
+  // check mixed dot product
+  typedef Matrix<RealScalar, MatrixType::RowsAtCompileTime, 1> RealVectorType;
+  RealVectorType rv1 = RandomMatrix<RealVectorType>(rows, 1, rmin, rmax);
+
+  VERIFY_IS_APPROX(v1.dot(rv1.template cast<Scalar>()), v1.dot(rv1));
+  VERIFY_IS_APPROX(rv1.template cast<Scalar>().dot(v1), rv1.dot(v1));
+
+  VERIFY(is_same_type(m1, m1.template conjugateIf<false>()));
+  VERIFY(is_same_type(m1.conjugate(), m1.template conjugateIf<true>()));
+}
+
+template <int>
+void adjoint_extra() {
+  MatrixXcf a(10, 10), b(10, 10);
+  VERIFY_RAISES_ASSERT(a = a.transpose());
+  VERIFY_RAISES_ASSERT(a = a.transpose() + b);
+  VERIFY_RAISES_ASSERT(a = b + a.transpose());
+  VERIFY_RAISES_ASSERT(a = a.conjugate().transpose());
+  VERIFY_RAISES_ASSERT(a = a.adjoint());
+  VERIFY_RAISES_ASSERT(a = a.adjoint() + b);
+  VERIFY_RAISES_ASSERT(a = b + a.adjoint());
+
+  // no assertion should be triggered for these cases:
+  a.transpose() = a.transpose();
+  a.transpose() += a.transpose();
+  a.transpose() += a.transpose() + b;
+  a.transpose() = a.adjoint();
+  a.transpose() += a.adjoint();
+  a.transpose() += a.adjoint() + b;
+
+  // regression tests for check_for_aliasing
+  MatrixXd c(10, 10);
+  c = 1.0 * MatrixXd::Ones(10, 10) + c;
+  c = MatrixXd::Ones(10, 10) * 1.0 + c;
+  c = c + MatrixXd::Ones(10, 10).cwiseProduct(MatrixXd::Zero(10, 10));
+  c = MatrixXd::Ones(10, 10) * MatrixXd::Zero(10, 10);
+
+  // regression for bug 1646
+  for (int j = 0; j < 10; ++j) {
+    c.col(j).head(j) = c.row(j).head(j);
+  }
+
+  for (int j = 0; j < 10; ++j) {
+    c.col(j) = c.row(j);
+  }
+
+  a.conservativeResize(1, 1);
+  a = a.transpose();
+
+  a.conservativeResize(0, 0);
+  a = a.transpose();
+}
+
+template <typename Scalar>
+void inner_product_boundary_sizes() {
+  const Index PS = internal::packet_traits<Scalar>::size;
+  // Sizes that exercise every branch in the 4-way unrolled vectorized inner product:
+  // scalar fallback (< PS), 1-3 packets, quad loop entry/exit, remainder packets, scalar cleanup
+  const Index sizes[] = {0,
+                         1,
+                         PS - 1,
+                         PS,
+                         PS + 1,
+                         2 * PS - 1,
+                         2 * PS,
+                         2 * PS + 1,
+                         3 * PS - 1,
+                         3 * PS,
+                         3 * PS + 1,
+                         4 * PS - 1,
+                         4 * PS,
+                         4 * PS + 1,
+                         8 * PS,
+                         8 * PS + 1,
+                         8 * PS + PS,
+                         8 * PS + 2 * PS,
+                         8 * PS + 3 * PS,
+                         8 * PS + 3 * PS + 1};
+  for (int si = 0; si < 20; ++si) {
+    const Index n = sizes[si];
+    if (n <= 0) continue;
+    typedef Matrix<Scalar, Dynamic, 1> Vec;
+    Vec v1 = Vec::Random(n);
+    Vec v2 = Vec::Random(n);
+    // Reference: scalar loop
+    Scalar expected(0);
+    for (Index k = 0; k < n; ++k) expected += numext::conj(v1(k)) * v2(k);
+    VERIFY_IS_APPROX(v1.dot(v2), expected);
+    // Also test squaredNorm
+    Scalar sq_expected(0);
+    for (Index k = 0; k < n; ++k) sq_expected += numext::conj(v1(k)) * v1(k);
+    VERIFY_IS_APPROX(v1.squaredNorm(), numext::real(sq_expected));
+  }
+}
+
+// dot() maps operands with a runtime unit stride to contiguous vectors and rewraps their unary ops around the map.
+// adjoint() nests a non-const Transpose, so the rewrap must produce the const-nested type unaryExpr() returns.
+template <typename Scalar>
+void inner_product_adjoint_rewrap() {
+  // Column-major so that row(r) has a compile-time non-unit stride and the raw maps below walk a row and a column.
+  using Mat = Matrix<Scalar, Dynamic, Dynamic, ColMajor>;
+  using Vec = Matrix<Scalar, Dynamic, 1>;
+  using StridedMap = Map<const Vec, Unaligned, InnerStride<Dynamic>>;
+  const Index n = internal::random<Index>(1, EIGEN_TEST_MAX_SIZE);
+  const Index r = internal::random<Index>(0, n - 1);
+  Mat m = Mat::Random(n, n);
+  Vec v = Vec::Random(n);
+  Scalar expected(0);
+  for (Index k = 0; k < n; ++k) expected += m(r, k) * v(k);
+
+  // Compile-time non-unit stride: the map path is instantiated but not taken.
+  VERIFY_IS_APPROX(m.row(r).adjoint().dot(v), expected);
+  VERIFY_IS_APPROX(v.dot(m.row(r).adjoint()), numext::conj(expected));
+  // Runtime strides: n skips the map, 1 takes it.
+  StridedMap row(m.data() + r, n, InnerStride<Dynamic>(n));
+  StridedMap column(m.data() + r * n, n, InnerStride<Dynamic>(1));
+  VERIFY_IS_APPROX(row.adjoint().dot(v), expected);
+  VERIFY_IS_APPROX(v.dot(row.adjoint()), numext::conj(expected));
+  VERIFY_IS_APPROX(column.adjoint().dot(v), (m.col(r).transpose() * v).value());
+  VERIFY_IS_APPROX(v.dot(column.adjoint()), numext::conj((m.col(r).transpose() * v).value()));
+}
+
+template <typename Lhs, typename Rhs>
+void check_inner_product(const MatrixBase<Lhs>& lhs, const MatrixBase<Rhs>& rhs) {
+  using Scalar = typename ScalarBinaryOpTraits<typename Lhs::Scalar, typename Rhs::Scalar>::ReturnType;
+  using RealScalar = typename NumTraits<Scalar>::Real;
+  using Wide = std::complex<long double>;
+  const auto widen = [](const auto& value) {
+    return Wide(static_cast<long double>(numext::real(value)), static_cast<long double>(numext::imag(value)));
+  };
+  Wide dot(0), product(0);
+  long double magnitude = 0;
+  for (Index i = 0; i < lhs.size(); ++i) {
+    const Wide a = widen(lhs.coeff(i)), b = widen(rhs.coeff(i));
+    dot += std::conj(a) * b;
+    product += a * b;
+    magnitude += std::abs(a) * std::abs(b);
+  }
+  // Complex multiply/add and the reference reduction fit within 8*n*eps*sum(|a_i|*|b_i|).
+  const long double bound = 8 * lhs.size() * static_cast<long double>(NumTraits<RealScalar>::epsilon()) * magnitude;
+  VERIFY(std::abs(widen(lhs.dot(rhs)) - dot) <= bound);
+  VERIFY(std::abs(widen((lhs.adjoint() * rhs).value()) - dot) <= bound);
+  VERIFY(std::abs(widen((lhs.transpose() * rhs).value()) - product) <= bound);
+  Matrix<Scalar, 1, 1> result;
+  result.noalias() = lhs.transpose() * rhs;
+  VERIFY(std::abs(widen(result.value()) - product) <= bound);
+  result.noalias() += lhs.transpose() * rhs;
+  VERIFY(std::abs(widen(result.value()) - 2.0L * product) <= 2 * bound);
+  result.noalias() -= lhs.transpose() * rhs;
+  VERIFY(std::abs(widen(result.value()) - product) <= 3 * bound);
+}
+
+template <typename Scalar>
+void inner_product_runtime_stride() {
+  using Vec = Matrix<Scalar, Dynamic, 1>;
+  using StridedMap = Map<const Vec, Unaligned, InnerStride<Dynamic>>;
+  const Index packetSize = internal::packet_traits<Scalar>::size;
+  const Index sizes[] = {
+      0, 1, 2, 3, 4, 5, packetSize - 1, packetSize, packetSize + 1, 4 * packetSize, 9 * packetSize + 1};
+  for (Index n : sizes) {
+    Vec a = Vec::Random(2 * n + 2), b = Vec::Random(2 * n + 2);
+    for (Index lhsStride : {1, 2, -2}) {
+      for (Index rhsStride : {1, 2, -2}) {
+        const StridedMap lhs(a.data() + (lhsStride < 0 && n > 0 ? 2 * n : 1), n, InnerStride<Dynamic>(lhsStride));
+        const StridedMap rhs(b.data() + (rhsStride < 0 && n > 0 ? 2 * n : 1), n, InnerStride<Dynamic>(rhsStride));
+        check_inner_product(lhs, rhs);
+        check_inner_product(-lhs.conjugate(), -rhs);
+        // A functor with state must survive rewrapping, including when it has no packet support.
+        const Scalar shift = internal::random<Scalar>();
+        check_inner_product(lhs.unaryExpr([=](Scalar x) { return x + shift; }), rhs);
+        check_inner_product(lhs.real(), rhs);
+        check_inner_product(lhs, rhs.real());
+      }
+    }
+    Map<const Vec, AlignedMax, InnerStride<Dynamic>> aligned(a.data(), n, InnerStride<Dynamic>(1));
+    Ref<const Vec, Unaligned, InnerStride<Dynamic>> ref(aligned);
+    check_inner_product(aligned, ref);
+    check_inner_product(ref, b.head(n));
+    check_inner_product(a.head(n), ref);
+    // Rows and columns can both become contiguous through their runtime outer dimension.
+    Matrix<Scalar, Dynamic, Dynamic, ColMajor> row = a.head(n).transpose();
+    Matrix<Scalar, Dynamic, Dynamic, RowMajor> col = b.head(n);
+    check_inner_product(row.row(0).transpose(), col.col(0));
+    VERIFY_RAISES_ASSERT(ref.dot(b));
+  }
+}
+
+template <typename Scalar>
+void inner_product_exact_values() {
+  using Vec = Matrix<Scalar, Dynamic, 1>;
+  for (Index n : {0, 1, 2, 3, 4, 5, 17, 65}) {
+    Vec a(2 * n), b(2 * n);
+    for (Index i = 0; i < 2 * n; ++i) {
+      a(i) = Scalar(i % 3 == 0);
+      b(i) = Scalar(i % 2 == 0);
+    }
+    for (Index stride : {1, 2}) {
+      const Map<const Vec, Unaligned, InnerStride<Dynamic>> lhs(a.data(), n, InnerStride<Dynamic>(stride));
+      const Map<const Vec, Unaligned, InnerStride<Dynamic>> rhs(b.data(), n, InnerStride<Dynamic>(stride));
+      Index count = 0;
+      for (Index i = 0; i < n; ++i) count += (i * stride) % 6 == 0;
+      VERIFY_IS_EQUAL(lhs.dot(rhs), Scalar(count));
+      VERIFY_IS_EQUAL((lhs.transpose() * rhs).value(), Scalar(count));
+    }
+  }
+}
+
+// Test transposeInPlace at vectorization boundary sizes.
+// BlockedInPlaceTranspose uses PacketSize-blocked loops with a scalar remainder (line 273),
+// exercising off-by-one-prone transitions.
+template <typename Scalar>
+void transposeInPlace_boundary() {
+  const Index PS = internal::packet_traits<Scalar>::size;
+  // Sizes around packet boundaries where the blocked path's remainder handling is exercised.
+  const Index sizes[] = {1,      2,          3,      PS - 1,     PS,     PS + 1,    2 * PS - 1,
+                         2 * PS, 2 * PS + 1, 3 * PS, 3 * PS + 1, 4 * PS, 4 * PS + 1};
+  for (int si = 0; si < 13; ++si) {
+    Index n = sizes[si];
+    if (n <= 0) continue;
+    typedef Matrix<Scalar, Dynamic, Dynamic> Mat;
+
+    // Square transposeInPlace
+    Mat m1 = Mat::Random(n, n);
+    Mat m2 = m1;
+    m2.transposeInPlace();
+    VERIFY_IS_APPROX(m2, m1.transpose());
+    // Double transpose should return to original
+    m2.transposeInPlace();
+    VERIFY_IS_APPROX(m2, m1);
+  }
+
+  // Non-square transposeInPlace (resizable dynamic matrices)
+  const Index rect_sizes[][2] = {{2, 5}, {PS, 2 * PS + 1}, {3, 1}, {1, 7}, {2 * PS, PS + 1}};
+  for (int si = 0; si < 5; ++si) {
+    Index r = rect_sizes[si][0], c = rect_sizes[si][1];
+    if (r <= 0 || c <= 0) continue;
+    typedef Matrix<Scalar, Dynamic, Dynamic> Mat;
+    Mat m1 = Mat::Random(r, c);
+    Mat expected = m1.transpose();
+    Mat m2 = m1;
+    m2.transposeInPlace();
+    VERIFY_IS_APPROX(m2, expected);
+    VERIFY(m2.rows() == c && m2.cols() == r);
+  }
+}
+
+template <typename Scalar, int Order, int InnerStride>
+void transposeInPlace_strided() {
+  using MatrixType = Matrix<Scalar, Dynamic, Dynamic, Order>;
+  using MapType = Map<MatrixType, Unaligned, Stride<Dynamic, InnerStride>>;
+  STATIC_CHECK(!(internal::evaluator<MapType>::Flags & PacketAccessBit));
+  const Index packetSize = internal::packet_traits<Scalar>::size;
+  const Index sizes[] = {1, packetSize, packetSize + 1, 2 * packetSize, 2 * packetSize + 1};
+  for (Index size : sizes) {
+    for (Index innerStride : {1, 2, 3}) {
+      if (InnerStride != Dynamic && innerStride != InnerStride) continue;
+      const Index outerStride = size * innerStride + 3;
+      Matrix<Scalar, Dynamic, 1> storage(size * outerStride + 2);
+      for (Index i = 0; i < storage.size(); ++i) storage(i) = Scalar(i + 1);
+      const Matrix<Scalar, Dynamic, 1> original = storage;
+      Matrix<Scalar, Dynamic, 1> expected = original;
+      // Include padding and interleaved coefficients in the exact comparison.
+      for (Index outer = 0; outer < size; ++outer)
+        for (Index inner = 0; inner < size; ++inner)
+          expected(1 + outer * outerStride + inner * innerStride) =
+              original(1 + inner * outerStride + outer * innerStride);
+      MapType mapped(storage.data() + 1, size, size, Stride<Dynamic, InnerStride>(outerStride, innerStride));
+      mapped.transposeInPlace();
+      VERIFY(storage == expected);
+      mapped.transposeInPlace();
+      VERIFY(storage == original);
+    }
+  }
+}
+
+EIGEN_DECLARE_TEST(adjoint) {
+  for (int i = 0; i < g_repeat; i++) {
+    CALL_SUBTEST_1(adjoint(Matrix<float, 1, 1>()));
+    CALL_SUBTEST_2(adjoint(Matrix3d()));
+    CALL_SUBTEST_3(adjoint(Matrix4f()));
+
+    CALL_SUBTEST_4(adjoint(MatrixXcf(internal::random<int>(1, EIGEN_TEST_MAX_SIZE / 2),
+                                     internal::random<int>(1, EIGEN_TEST_MAX_SIZE / 2))));
+    CALL_SUBTEST_5(adjoint(
+        MatrixXi(internal::random<int>(1, EIGEN_TEST_MAX_SIZE), internal::random<int>(1, EIGEN_TEST_MAX_SIZE))));
+    CALL_SUBTEST_6(adjoint(
+        MatrixXf(internal::random<int>(1, EIGEN_TEST_MAX_SIZE), internal::random<int>(1, EIGEN_TEST_MAX_SIZE))));
+
+    // Complement for 128 bits vectorization:
+    CALL_SUBTEST_8(adjoint(Matrix2d()));
+    CALL_SUBTEST_9(adjoint(Matrix<int, 4, 4>()));
+
+    // 256 bits vectorization:
+    CALL_SUBTEST_10(adjoint(Matrix<float, 8, 8>()));
+    CALL_SUBTEST_11(adjoint(Matrix<double, 4, 4>()));
+    CALL_SUBTEST_12(adjoint(Matrix<int, 8, 8>()));
+  }
+  // test a large static matrix only once
+  CALL_SUBTEST_7(adjoint(Matrix<float, 100, 100>()));
+
+  CALL_SUBTEST_13(adjoint_extra<0>());
+
+  // Inner product vectorization boundary tests (deterministic, outside g_repeat)
+  CALL_SUBTEST_14(inner_product_boundary_sizes<float>());
+  CALL_SUBTEST_15(inner_product_boundary_sizes<double>());
+  CALL_SUBTEST_16(inner_product_boundary_sizes<std::complex<float>>());
+  CALL_SUBTEST_17(inner_product_boundary_sizes<std::complex<double>>());
+  for (int i = 0; i < g_repeat; i++) {
+    CALL_SUBTEST_19(inner_product_adjoint_rewrap<double>());
+    CALL_SUBTEST_19(inner_product_adjoint_rewrap<std::complex<float>>());
+    CALL_SUBTEST_19(inner_product_adjoint_rewrap<std::complex<double>>());
+  }
+
+  CALL_SUBTEST_20(inner_product_runtime_stride<float>());
+  CALL_SUBTEST_21(inner_product_runtime_stride<double>());
+  CALL_SUBTEST_22(inner_product_runtime_stride<std::complex<float>>());
+  CALL_SUBTEST_23(inner_product_runtime_stride<std::complex<double>>());
+
+  CALL_SUBTEST_24(inner_product_exact_values<int>());
+  CALL_SUBTEST_24(inner_product_exact_values<bool>());
+  CALL_SUBTEST_24(inner_product_exact_values<half>());
+  CALL_SUBTEST_24(inner_product_exact_values<bfloat16>());
+
+  // transposeInPlace at vectorization boundaries (deterministic, outside g_repeat).
+  CALL_SUBTEST_18(transposeInPlace_boundary<float>());
+  CALL_SUBTEST_18(transposeInPlace_boundary<double>());
+  CALL_SUBTEST_18(transposeInPlace_boundary<std::complex<float>>());
+
+  CALL_SUBTEST_19((transposeInPlace_strided<float, ColMajor, Dynamic>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<float, RowMajor, Dynamic>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<double, ColMajor, Dynamic>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<double, RowMajor, Dynamic>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<float, ColMajor, 2>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<float, RowMajor, 2>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<double, ColMajor, 2>()));
+  CALL_SUBTEST_19((transposeInPlace_strided<double, RowMajor, 2>()));
+}

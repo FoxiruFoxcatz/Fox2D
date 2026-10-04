@@ -1,0 +1,398 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: The Eigen Authors
+# SPDX-License-Identifier: MPL-2.0
+
+set -x
+
+rootdir=`pwd`
+mkdir -p ${EIGEN_CI_BUILDDIR}
+cd ${EIGEN_CI_BUILDDIR}
+
+# Compile through ccache when the job enables it and the image provides it.
+# The GitLab cache holds ${CCACHE_DIR}, keyed on content and compiler, so it
+# still hits after the fresh per-job clone re-stamps every source mtime
+# (which makes any cached ninja state rebuild from scratch).
+# EIGEN_CI_CCACHE_* provide the YAML fallback defaults.  A runner may explicitly
+# set standard CCACHE_* variables (e.g. CCACHE_DIR to a persistent host bind-mount)
+# in the runner's config.toml without being overridden by the YAML template.
+export CCACHE_DIR="${CCACHE_DIR:-${EIGEN_CI_CCACHE_DIR}}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-${EIGEN_CI_CCACHE_MAXSIZE}}"
+export CCACHE_BASEDIR="${CCACHE_BASEDIR:-${EIGEN_CI_CCACHE_BASEDIR}}"
+export CCACHE_COMPRESSLEVEL="${CCACHE_COMPRESSLEVEL:-${EIGEN_CI_CCACHE_COMPRESSLEVEL}}"
+for v in CCACHE_DIR CCACHE_MAXSIZE CCACHE_BASEDIR CCACHE_COMPRESSLEVEL; do
+  [[ -n "${!v}" ]] || unset "${v}"
+done
+# Compiler cache launcher selection:
+# Prefer sccache (Mozilla Shared Compilation Cache) with native Google Cloud Storage
+# remote backend (gs://eigen-gitlab-ci-cache). If sccache or GCS authentication is
+# unavailable, fall back to ccache with local disk / GitLab runner cache.
+launchers=""
+compiler_launcher=""
+
+if [[ "${EIGEN_CI_CCACHE}" == "on" ]]; then
+  . "${rootdir}/ci/scripts/install_compiler_cache.sh"
+
+  if [[ "${EIGEN_CI_SCCACHE:-on}" != "off" && -n "${sccache_bin}" ]]; then
+    export SCCACHE_DIR="${SCCACHE_DIR:-${EIGEN_CI_SCCACHE_DIR:-${CI_PROJECT_DIR}/.sccache}}"
+    export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-${EIGEN_CI_SCCACHE_CACHE_SIZE:-4G}}"
+    export SCCACHE_BASEDIRS="${rootdir}"
+    export SCCACHE_SERVER_PORT="$((4226 + (${CI_JOB_ID:-0} % 10000)))"
+
+    # Remote GCS caching via short-lived OAuth token injected from GitLab CI/CD variables:
+    # EIGEN_GCS_CACHE_TOKEN_RW (protected branch / master) or EIGEN_GCS_CACHE_TOKEN_RO (MRs)
+    sccache_cred_server_pid=""
+    { set +x; } 2>/dev/null
+    if [[ -n "${EIGEN_GCS_CACHE_TOKEN_RW:-}" || -n "${EIGEN_GCS_CACHE_TOKEN_RO:-}" ]]; then
+      export SCCACHE_GCS_BUCKET="${EIGEN_CI_SCCACHE_GCS_BUCKET:-eigen-gitlab-ci-cache}"
+      export SCCACHE_MULTILEVEL_CHAIN="disk,gcs"
+      if [[ -n "${EIGEN_GCS_CACHE_TOKEN_RW:-}" ]]; then
+        export SCCACHE_GCS_RW_MODE="READ_WRITE"
+      else
+        export SCCACHE_GCS_RW_MODE="READ_ONLY"
+      fi
+      export GCS_URL_SECRET=$(od -vN 16 -An -tx1 /dev/urandom | tr -d ' \n')
+      cred_port_file="${PWD}/.cred_port"
+
+      python3 -c "
+import http.server, json, sys, os
+token = os.environ.get('EIGEN_GCS_CACHE_TOKEN_RW') or os.environ.get('EIGEN_GCS_CACHE_TOKEN_RO')
+secret = os.environ.get('GCS_URL_SECRET')
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/token/' + secret:
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'accessToken': token}).encode())
+    def log_message(self, *a): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), H)
+with open('${cred_port_file}', 'w') as f:
+    f.write(str(server.server_port))
+server.serve_forever()
+" &
+      sccache_cred_server_pid=$!
+      trap '[[ -n "${sccache_cred_server_pid}" ]] && kill "${sccache_cred_server_pid}" 2>/dev/null || true' EXIT
+
+      # Wait up to 2 seconds for local credential server to be ready
+      cred_port=""
+      for _ in {1..40}; do
+        if [[ -s "${cred_port_file}" ]]; then
+          cred_port=$(cat "${cred_port_file}")
+          if curl -s "http://127.0.0.1:${cred_port}/token/${GCS_URL_SECRET}" >/dev/null 2>&1; then break; fi
+        fi
+        sleep 0.05
+      done
+      if [[ -n "${cred_port:-}" ]]; then
+        export SCCACHE_GCS_CREDENTIALS_URL="http://127.0.0.1:${cred_port}/token/${GCS_URL_SECRET}"
+      else
+        echo "Notice: Local credential server failed to bind or respond; skipping GCS remote cache." >&2
+        unset SCCACHE_GCS_BUCKET
+        unset SCCACHE_GCS_RW_MODE
+        unset SCCACHE_MULTILEVEL_CHAIN
+        [[ -n "${sccache_cred_server_pid}" ]] && kill "${sccache_cred_server_pid}" 2>/dev/null || true
+        sccache_cred_server_pid=""
+      fi
+      rm -f "${cred_port_file}"
+      unset GCS_URL_SECRET
+    fi
+    set -x
+
+    if "${sccache_bin}" --start-server >/dev/null 2>&1; then
+      compiler_launcher="sccache"
+      "${sccache_bin}" --zero-stats >/dev/null 2>&1 || true
+      launchers="-DCMAKE_C_COMPILER_LAUNCHER=${sccache_bin} -DCMAKE_CXX_COMPILER_LAUNCHER=${sccache_bin}"
+    else
+      echo "Notice: sccache server failed to start (check GCS credentials/network); falling back to ccache."
+      [[ -n "${sccache_cred_server_pid}" ]] && kill "${sccache_cred_server_pid}" 2>/dev/null || true
+      sccache_cred_server_pid=""
+    fi
+  fi
+
+  if [[ -z "${compiler_launcher}" && -n "${ccache_bin}" ]]; then
+    compiler_launcher="ccache"
+    launchers="-DCMAKE_C_COMPILER_LAUNCHER=${ccache_bin} -DCMAKE_CXX_COMPILER_LAUNCHER=${ccache_bin}"
+    # Log stats per job via CCACHE_STATSLOG rather than global --zero-stats /
+    # --show-stats so concurrent jobs sharing a host CCACHE_DIR do not reset or
+    # mix each other's counters. Fall back to global counters if ccache predates
+    # --show-log-stats (ccache < 4.4, e.g. Ubuntu 20.04).
+    export CCACHE_STATSLOG="${PWD}/ccache-stats.log"
+    rm -f "${CCACHE_STATSLOG}"
+    if ! "${ccache_bin}" --show-log-stats >/dev/null 2>&1; then
+      unset CCACHE_STATSLOG
+      "${ccache_bin}" --zero-stats
+    fi
+  fi
+fi
+
+show_ccache_stats() {
+  if [[ "${compiler_launcher}" == "sccache" && -n "${sccache_bin}" ]]; then
+    "${sccache_bin}" --show-stats 2>&1 || true
+    "${sccache_bin}" --stop-server >/dev/null 2>&1 || true
+    if [[ -n "${sccache_cred_server_pid}" ]]; then
+      kill "${sccache_cred_server_pid}" 2>/dev/null || true
+      sccache_cred_server_pid=""
+    fi
+    # Incompatible cache formats: purge unused .ccache/ before cache upload so the
+    # uploaded cache archive only holds .sccache/ and stays strictly below the 5 GB runner cap.
+    rm -rf "${rootdir}/.ccache"
+  elif [[ "${compiler_launcher}" == "ccache" && -n "${ccache_bin}" ]]; then
+    if [[ -n "${CCACHE_STATSLOG}" ]]; then
+      "${ccache_bin}" --show-log-stats
+      rm -f "${CCACHE_STATSLOG}"
+    else
+      "${ccache_bin}" --show-stats
+    fi
+    # Incompatible cache formats: purge unused .sccache/ before cache upload.
+    rm -rf "${rootdir}/.sccache"
+  fi
+}
+
+cmake -G Ninja                                                   \
+  -DCMAKE_CXX_COMPILER=${EIGEN_CI_CXX_COMPILER}                  \
+  -DCMAKE_C_COMPILER=${EIGEN_CI_C_COMPILER}                      \
+  -DCMAKE_CXX_COMPILER_TARGET=${EIGEN_CI_CXX_COMPILER_TARGET}    \
+  ${launchers}                                                   \
+  ${EIGEN_CI_ADDITIONAL_ARGS} ${rootdir}
+
+# The affected-tests tier (see scripts/affected_tests.py) passes its selection
+# as a file rather than a variable so the list is not bounded by CI variable
+# limits.  The file holds "NONE" or one target per line; the full-suite form is
+# "buildtests" plus the targets it does not aggregate, and so takes the same
+# path as any other list.
+# Targets that this configuration did not register (optional dependencies such
+# as CHOLMOD, CUDA or SYCL) are dropped here: ninja aborts on an unknown target,
+# and this is the first point that knows what CMake actually configured.
+selected_targets=""
+if [[ -n "${EIGEN_CI_BUILD_TARGET_FILE}" ]]; then
+  target_file="${EIGEN_CI_BUILD_TARGET_FILE}"
+  [[ "${target_file}" = /* ]] || target_file="${rootdir}/${target_file}"
+  # Fail loudly rather than falling through to the default target: a missing
+  # selection would otherwise silently build the entire test suite.
+  if [[ ! -f "${target_file}" ]]; then
+    echo "EIGEN_CI_BUILD_TARGET_FILE=${EIGEN_CI_BUILD_TARGET_FILE} does not exist." >&2
+    echo "The select:tests artifact is missing; refusing to guess a build target." >&2
+    exit 1
+  fi
+  requested=$(cat "${target_file}")
+  if [[ "${requested}" == "NONE" ]]; then
+    echo "No tests are affected by this merge request; nothing to build."
+    cd ${rootdir}
+    set +x
+    return 0 2>/dev/null || exit 0
+  else
+    { set +x; } 2>/dev/null
+    # The runner sources this script under `set -eo pipefail`, so every command
+    # substitution below has to end in a success status: a failed ninja, or a
+    # grep that legitimately counts zero lines, would otherwise abandon the job
+    # before the checks that are meant to report it.
+    configured=$(ninja -t targets all 2>/dev/null | sed -n 's/^\([A-Za-z_0-9]*\): phony$/\1/p' | sort -u || true)
+    # An empty query means ninja is unusable, not that nothing is configured.
+    # Without this the intersection below would be empty and the job would
+    # trivially "succeed" having built nothing.
+    if [[ -z "${configured}" ]]; then
+      echo "Could not enumerate configured targets via 'ninja -t targets'." >&2
+      exit 1
+    fi
+    requested_targets=$(echo "${requested}" | sort -u)
+    selected_targets=$(comm -12 <(echo "${requested_targets}") <(echo "${configured}"))
+    unconfigured=$(comm -23 <(echo "${requested_targets}") <(echo "${configured}"))
+    nrequested=$(echo "${requested_targets}" | grep -c . || true)
+    nselected=$(echo "${selected_targets}" | grep -c . || true)
+    echo "Affected selection: ${nselected} of ${nrequested} requested targets are configured here."
+    if [[ -n "${unconfigured}" ]]; then
+      echo "Not configured in this build: $(echo "${unconfigured}" | tr '\n' ' ')"
+    fi
+    set -x
+    if [[ -z "${selected_targets}" ]]; then
+      echo "None of the affected tests exist in this configuration; nothing to build."
+      cd ${rootdir}
+      set +x
+      return 0 2>/dev/null || exit 0
+    fi
+    EIGEN_CI_BUILD_TARGET=$(echo "${selected_targets}" | tr '\n' ' ')
+  fi
+fi
+
+target=""
+if [[ ${EIGEN_CI_BUILD_TARGET} ]]; then
+  target="--target ${EIGEN_CI_BUILD_TARGET}"
+fi
+
+# Builds (particularly gcc) sometimes get killed, potentially when running
+# out of resources.  In that case, keep trying to build the remaining
+# targets (k0), then retry with reduced parallelism to minimize resource use.
+# EIGEN_CI_BUILD_JOBS can be set to limit parallelism for memory-hungry
+# compilers (e.g. NVHPC).  When unset, leave -j off so ninja picks its
+# own default (NPROC + 2).  njobs is still needed for batch-size sizing.
+njobs=${EIGEN_CI_BUILD_JOBS:-${NPROC}}
+jobs=""
+if [[ -n "${EIGEN_CI_BUILD_JOBS}" ]]; then
+  jobs="-j${EIGEN_CI_BUILD_JOBS}"
+fi
+
+# Fallback parallelism for retry builds after a failure (default: 2).
+fallback_jobs="-j${EIGEN_CI_FALLBACK_JOBS:-2}"
+
+# For phony meta-targets (e.g. buildtests), shuffle the dependency list and
+# build in batches so that memory-hungry compilations (like bdcsvd with
+# nvc++) are spread out instead of all running at once.  Ninja ignores the
+# command-line target order and schedules by its dependency graph, so we
+# must feed it batches to actually influence scheduling.
+#
+# Every batch is a barrier, so the batch has to hold enough work to keep all
+# cores busy until the slowest target in it finishes.  Per-target compile times
+# are heavily right-skewed (median around 10s, worst case several minutes), so a
+# batch only a small multiple of njobs drains almost immediately and then runs
+# down to a single straggler.  Measured runner occupancy on the 2026-08-02
+# nightly, at the old depth of max(2 * njobs, 48):
+#
+#   32 vCPU, batch 64   depth 1.9x   39% busy
+#    8 vCPU, batch 48   depth 4.8x   66% busy
+#    4 vCPU, batch 48   depth 8.0x   78% busy
+#
+# Peak concurrency, and hence peak memory, is set by -j and is unchanged by the
+# batch size; the batch only controls which targets may co-run.  Override with
+# EIGEN_CI_BUILD_BATCH_SIZE for fine-grained control.
+default_batch=$((njobs * 8))
+default_batch=$((default_batch > 96 ? default_batch : 96))
+batch_size=${EIGEN_CI_BUILD_BATCH_SIZE:-${default_batch}}
+shuffled=false
+# An affected-tests selection names CMake targets, and most of those are
+# aggregates: "buildtests", and the parent of every split test (bdcsvd depends
+# on bdcsvd_1..bdcsvd_41).  The batch loop can only spread apart the targets it
+# is handed, so an unexpanded parent puts a whole test family in one batch and
+# lets all of its parts co-run.  expand_to_leaves resolves them first.
+#
+# CMake emits every aggregate as a phony edge, so descending through phony
+# edges alone reaches the compiles and links without walking into object files:
+# buildtests -> test/bdcsvd_1, bdcsvd -> test/bdcsvd -> test/bdcsvd_1, and a
+# plain executable such as bug1213 -> test/bug1213, which is already a link
+# edge and stays as it is.
+expand_to_leaves() {
+  local scratch depth
+  scratch=$(mktemp -d)
+  printf '%s\n' ${1} | awk 'NF' | sort -u > "${scratch}/frontier"
+  : > "${scratch}/leaves"
+  # Every level costs one ninja invocation over the whole frontier (about 0.1s
+  # for the full suite).  Three levels are enough for the graph above; the cap
+  # only bounds an unexpected cycle.
+  for depth in 1 2 3 4 5 6 7 8; do
+    [[ -s "${scratch}/frontier" ]] || break
+    # A query that cannot be answered is not a reason to drop targets: leave
+    # the frontier unexpanded and let ninja resolve it during the build.
+    ninja -t query $(cat "${scratch}/frontier") > "${scratch}/query" 2>/dev/null || break
+    awk '
+      function flush() {
+        if (name == "") return
+        if (rule == "phony" && ninputs > 0) {
+          for (i = 1; i <= ninputs; i++) print "N", inputs[i]
+        } else {
+          print "L", name
+        }
+        name = ""; rule = ""; ninputs = 0; section = ""
+      }
+      /^[^ ]/       { flush(); name = $0; sub(/:$/, "", name); next }
+      /^  input:/   { rule = $2; section = "input"; next }
+      /^  outputs:/ { section = ""; next }
+      section == "input" && /^    / { inputs[++ninputs] = $1 }
+      END { flush() }
+    ' "${scratch}/query" > "${scratch}/classified"
+    sed -n 's/^L //p' "${scratch}/classified" >> "${scratch}/leaves"
+    sed -n 's/^N //p' "${scratch}/classified" | sort -u > "${scratch}/next"
+    mv "${scratch}/next" "${scratch}/frontier"
+  done
+  # Whatever is still unexpanded -- a failed query or a chain past the cap --
+  # is built as named.  Empty after a normal walk.
+  cat "${scratch}/frontier" >> "${scratch}/leaves"
+  sort -u "${scratch}/leaves"
+  rm -rf "${scratch}"
+}
+
+deps=""
+if [[ -n "${selected_targets}" ]] && command -v ninja >/dev/null 2>&1; then
+  { set +x; } 2>/dev/null
+  deps=$(expand_to_leaves "${selected_targets}")
+# The meta-target path below quotes EIGEN_CI_BUILD_TARGET into `ninja -t query`,
+# so a space-separated list (the SME cross-build's product_* targets) would go in
+# as one bogus name and make the query fail, aborting the job before any build
+# runs.  Skip batching for a list and let the plain `cmake --build --target t1 t2
+# ...` at the end build it directly; it handles multiple targets.
+elif [[ -n "${EIGEN_CI_BUILD_TARGET}" && "${EIGEN_CI_BUILD_TARGET}" != *[[:space:]]* ]] && command -v ninja >/dev/null 2>&1; then
+  # Suppress xtrace while extracting and shuffling the target list
+  # to avoid dumping ~1200 lines to the CI log.
+  { set +x; } 2>/dev/null
+  deps=$(ninja -t query "${EIGEN_CI_BUILD_TARGET}" 2>/dev/null \
+         | awk '/^  input:/{found=1; next} /^  outputs:/{found=0} found && /^    /{print $1}')
+  # CMake custom targets like BuildOfficial have an intermediate phony
+  # (e.g. test/BuildOfficial) that holds the real dependencies.  If we
+  # got exactly one dep, resolve it one more level.
+  if [[ $(echo "$deps" | wc -l) -eq 1 ]] && [[ -n "$deps" ]]; then
+    inner=$(ninja -t query "$deps" 2>/dev/null \
+            | awk '/^  input:/{found=1; next} /^  outputs:/{found=0} found && /^    /{print $1}')
+    if [[ -n "$inner" ]]; then
+      deps="$inner"
+    fi
+  fi
+fi
+
+if [[ -n "${deps}" ]]; then
+  # Deterministic shuffle: hash each target name and sort by hash.
+  # Stable across runs (helps ninja's .ninja_log and build caches),
+  # portable (no shuf dependency), and spreads same-family targets apart.
+  # Uses Knuth's multiplicative hash (golden-ratio prime 2654435761) for
+  # good avalanche — similar names like bdcsvd_1..bdcsvd_51 get widely
+  # dispersed instead of clustering together.
+  shuffled_deps=$(echo "$deps" | awk '
+    BEGIN { for(i=0;i<128;i++) ord[sprintf("%c",i)]=i }
+    { h=0
+      for(i=1;i<=length($0);i++) h=(h+ord[substr($0,i,1)])*2654435761%2147483647
+      printf "%010d %s\n",h,$0 }' | sort | sed 's/^[^ ]* //')
+  if [[ -n "$shuffled_deps" ]]; then
+    ndeps=$(echo "$shuffled_deps" | wc -l)
+    echo "Building ${ndeps} targets in batches of ${batch_size} (njobs=${njobs})"
+    shuffled=true
+    # Build in batches: ninja parallelises within each batch, but batches
+    # run sequentially so memory-hungry targets from different families
+    # don't pile up simultaneously.  Track failures so we can report the
+    # right exit code at the end.
+    # Note: xtrace stays off to avoid dumping the full target list.
+    # Use process substitution so the while loop runs in the current
+    # shell and build_failed propagates.
+    batch_num=0
+    build_failed=false
+    while IFS= read -r batch; do
+      batch_num=$((batch_num + 1))
+      echo "=== Batch ${batch_num} ==="
+      ninja -k0 ${jobs} ${batch} || ninja -k0 ${fallback_jobs} ${batch} || build_failed=true
+    done < <(echo "$shuffled_deps" | xargs -n "${batch_size}")
+    if [[ "$build_failed" == "true" ]]; then
+      echo "Some batches failed."
+      # The cache is pushed even on failure (cache:when: always), so the
+      # stats still describe what the next attempt can reuse.
+      show_ccache_stats
+      cd ${rootdir}
+      exit 1
+    fi
+  fi
+  set -x
+fi
+
+if [[ "$shuffled" != "true" ]]; then
+  build_failed=false
+  cmake --build . ${target} -- -k0 ${jobs} || cmake --build . ${target} -- -k0 ${fallback_jobs} || build_failed=true
+  if [[ "$build_failed" == "true" ]]; then
+    show_ccache_stats
+    cd ${rootdir}
+    exit 1
+  fi
+fi
+
+# Hit/miss summary for judging what the cache pays for on this job.
+show_ccache_stats
+
+cd ${rootdir}
+
+set +x

@@ -1,0 +1,117 @@
+# This file is part of Eigen, a lightweight C++ template library
+# for linear algebra.
+#
+# Copyright (C) 2023, The Eigen Authors
+#
+# This Source Code Form is subject to the terms of the Mozilla
+# Public License v. 2.0. If a copy of the MPL was not distributed
+# with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+
+default:
+  interruptible: true
+  # Auto-retry infrastructure drops (e.g. GCP Spot VM preemption or runner loss).
+  # Genuine compile or test failures exit with script_failure and are not retried.
+  # `stuck_or_timeout_failure` is a deprecated alias (GitLab 19.1) that lints with
+  # a warning; `no_updates_running` is the member of it that matters here.
+  retry:
+    max: 2  # Up to 2 retries (3 attempts total) before failing
+    when:
+      - runner_system_failure               # Runner setup or environment errors (e.g. Docker crash)
+      - runner_interrupted                  # Runner restart, shutdown or host reclamation mid-job
+      - runner_external_dependency_failure  # Registry, network or DNS failure fetching a job dependency
+      - no_updates_running                  # Host terminated mid-run (e.g. GCP Spot preemption)
+
+# For MR pipelines, auto-cancel running jobs when new commits are pushed.
+# For scheduled (weekly) pipelines, never auto-cancel so all jobs run to
+# completion and all failures are visible for debugging.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+    on_job_failure: none
+  rules:
+    # A scheduled pipeline off the default branch keeps `auto_cancel: none`,
+    # but is scoped like any other non-default ref: only default-branch builds
+    # write the shared pool.
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH
+      auto_cancel:
+        on_new_commit: none
+      variables:
+        EIGEN_CI_CCACHE_SCOPE: "-$CI_COMMIT_REF_SLUG"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      auto_cancel:
+        on_new_commit: none
+    # Give each merge request its own ccache pool, keyed by IID so it survives
+    # a force-push or a rebase: rebuild N of an MR then reuses rebuild N-1
+    # instead of whatever unrelated pipeline wrote the shared pool last.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        EIGEN_CI_CCACHE_SCOPE: "-mr$CI_MERGE_REQUEST_IID"
+    # Same for a branch pipeline off the default branch, so only default-branch
+    # builds write the shared pool.
+    - if: $CI_COMMIT_REF_NAME != $CI_DEFAULT_BRANCH
+      variables:
+        EIGEN_CI_CCACHE_SCOPE: "-$CI_COMMIT_REF_SLUG"
+    - when: always
+
+stages:
+  - checkformat
+  - select
+  - build
+  - test
+  - deploy
+
+variables:
+  # Pre-baked CI images hosted in the GitLab container registry.
+  # Override in project/fork settings if you host the images elsewhere.
+  # See ci/docker/ for the corresponding Dockerfiles.
+  # Slim images used for MR smoke tests (gcc-10 + clang-14).
+  # Builds are cross-compiled on arm64; tests run on their native runner.
+  EIGEN_CI_IMAGE_LINUX_AMD64_SMOKETEST_BUILD: "registry.gitlab.com/libeigen/eigen/ubuntu-24.04-amd64-smoketest-build:latest"
+  EIGEN_CI_IMAGE_LINUX_AMD64_SMOKETEST_RUN: "registry.gitlab.com/libeigen/eigen/ubuntu-24.04-amd64-smoketest-run:latest"
+  EIGEN_CI_IMAGE_LINUX_ARM64_SMOKETEST_BUILD: "registry.gitlab.com/libeigen/eigen/ubuntu-24.04-arm64-smoketest-build:latest"
+  EIGEN_CI_IMAGE_LINUX_ARM64_SMOKETEST_RUN: "registry.gitlab.com/libeigen/eigen/ubuntu-24.04-arm64-smoketest-run:latest"
+  EIGEN_CI_IMAGE_LINUX_RISCV64_SMOKETEST_BUILD: "registry.gitlab.com/libeigen/eigen/ubuntu-26.04-riscv64-smoketest-build:latest"
+  EIGEN_CI_IMAGE_LINUX_RISCV64_SMOKETEST_RUN: "registry.gitlab.com/libeigen/eigen/ubuntu-26.04-riscv64-smoketest-run:latest"
+  # clang and clang-tidy 18 for checkformat:clangtidy; see ci/tidy/.
+  # Versioned: bump the tag with any change to ci/tidy/Dockerfile.
+  EIGEN_CI_IMAGE_LINUX_TIDY: "registry.gitlab.com/libeigen/eigen/ubuntu-24.04-tidy:1"
+  # Lint tools for the checkformat jobs and select:tests; see ci/lint/.
+  EIGEN_CI_IMAGE_LINUX_LINT: "registry.gitlab.com/libeigen/eigen/alpine-lint:latest"
+  # CMake build directory.
+  EIGEN_CI_BUILDDIR: .build
+  # Specify the CMake build target.
+  EIGEN_CI_BUILD_TARGET: ""
+  # If a test regex is specified, that will be selected.
+  # Otherwise, we will try a label if specified.
+  EIGEN_CI_CTEST_REGEX: ""
+  # Valid CTest labels: Official, Contrib, gpu, smoketest.
+  EIGEN_CI_CTEST_LABEL: ""
+  EIGEN_CI_CTEST_ARGS: ""
+  # Affected-test tier: paths to the selection written by the select:tests job.
+  # Unset for every other job, which keeps their existing behaviour.
+  EIGEN_CI_BUILD_TARGET_FILE: ""
+  EIGEN_CI_CTEST_REGEX_FILE: ""
+  # ccache pool suffix, set per pipeline by the workflow rules above and empty
+  # on the default branch.  A job variable outranks one from a workflow rule,
+  # so a job opts out of scoping by setting this back to "" -- which is what
+  # .smoketest:build does, and the only reason to set it in a job.
+  EIGEN_CI_CCACHE_SCOPE: ""
+  # Scope of a scheduled pipeline.  Empty runs the full matrix.  "gpu" runs the
+  # GPU build and test jobs alone, so a second schedule can exercise the GPU
+  # runners more often than the weekly full run without paying for the rest of
+  # the matrix.  Set it as a variable on that schedule in the project's CI
+  # settings; every non-GPU rule set that fires on "schedule" opens with
+  # .rules:libeigen:gpu-schedule-guard.
+  EIGEN_CI_SCHEDULE_SCOPE: ""
+
+include:
+  - "/ci/checkformat.gitlab-ci.yml"
+  - "/ci/common.gitlab-ci.yml"
+  - "/ci/images.gitlab-ci.yml"
+  - "/ci/select.gitlab-ci.yml"
+  - "/ci/build.linux.gitlab-ci.yml"
+  - "/ci/build.windows.gitlab-ci.yml"
+  - "/ci/test.linux.gitlab-ci.yml"
+  - "/ci/test.windows.gitlab-ci.yml"
+  - "/ci/deploy.gitlab-ci.yml"

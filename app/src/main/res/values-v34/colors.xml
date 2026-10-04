@@ -1,0 +1,3 @@
+<resources>
+    <color name="splash_background">@android:color/system_surface_light</color>
+</resources>

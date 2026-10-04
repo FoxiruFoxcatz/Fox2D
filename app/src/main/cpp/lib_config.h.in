@@ -1,0 +1,2 @@
+#pragma once
+#define FOXIRU_LIB_NAME "@LIB_NAME@"
