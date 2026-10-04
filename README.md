@@ -39,17 +39,18 @@ An open source Animation 2D app for Android.
 - Choose resolution, codec and quality
 
 ---
-
+## Done ✅ 
+- Keyframes
+- Deform and Bone tools
+- Animated (keyframed) transforms – a transform is currently one fixed position / rotation / size per track
 ## Not done yet
 
 Some entries are visible in the app but not working yet:
 
 - Smudge and blur brushes
-- Deform and bone tools
-- Keyframes and a graph editor
+- Graph editor
 - Onion skin
-- Animated (keyframed) transforms – a transform is currently one fixed position / rotation / size per track
-
+- More Features are not Done yet
 ---
 
 ## Tech
