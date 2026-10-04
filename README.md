@@ -91,6 +91,11 @@ OpenGL ES 3.0 is required.
 Fox2D is open source and in its first days, so help is very welcome: bug reports, ideas, and pull requests.
 When you report a bug, please include your device, Android version and the steps to reproduce it.
 
+## DONATION 
+
+- Donate me at Remitly App or GCash App (If you are from the Philippines)
+- Number: 0993 893 1424
+  
 ## License
 
 Fox2D is released under the [MIT License](LICENSE).
