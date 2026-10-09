@@ -26,7 +26,14 @@ object RigLimits {
     const val MAX_CTL = 16
     const val CURVE_CHANS = 1 + 3 * MAX_CTL
     const val CURVE_BASE = MAX_BONES * BONE_CHANS
-    const val TOTAL_CHANS = CURVE_BASE + MAX_CURVES * CURVE_CHANS
+    const val MAX_PINS = 24
+    const val PIN_CHANS = 2
+    const val PIN_BASE = CURVE_BASE + MAX_CURVES * CURVE_CHANS
+    const val PIN_STRIDE = 6
+    const val PIN_HEAD = 2
+    /** Pin rotation channels (degrees, clockwise): one per pin, after the offset channels so old pin keys keep their ids. */
+    const val PIN_ROT_BASE = PIN_BASE + MAX_PINS * PIN_CHANS
+    const val TOTAL_CHANS = PIN_ROT_BASE + MAX_PINS
     const val BONE_STRIDE = 20
     const val CTL_STRIDE = 6
     const val CURVE_HEAD = 8
@@ -48,7 +55,17 @@ object RigChan {
     /** [c]: 0 = offset X, 1 = offset Y, 2 = thickness. */
     fun ctl(k: Int, i: Int, c: Int) = RigLimits.CURVE_BASE + k * RigLimits.CURVE_CHANS + 1 + i * 3 + c
 
+    /** Puppet-warp pin [i]; [c]: 0 = offset X, 1 = offset Y. */
+    fun pin(i: Int, c: Int) = RigLimits.PIN_BASE + i * RigLimits.PIN_CHANS + c
+    /** Rotation of puppet-warp pin [i], degrees clockwise. */
+    fun pinRot(i: Int) = RigLimits.PIN_ROT_BASE + i
+
     fun isBone(ch: Int) = ch < RigLimits.CURVE_BASE
+    fun isPin(ch: Int) = ch >= RigLimits.PIN_BASE
+    fun isPinRot(ch: Int) = ch >= RigLimits.PIN_ROT_BASE
+    fun pinOf(ch: Int) = if (isPinRot(ch)) ch - RigLimits.PIN_ROT_BASE else (ch - RigLimits.PIN_BASE) / RigLimits.PIN_CHANS
+    /** 0 = offset X, 1 = offset Y, 2 = rotation. */
+    fun pinSlot(ch: Int) = if (isPinRot(ch)) 2 else (ch - RigLimits.PIN_BASE) % RigLimits.PIN_CHANS
     fun boneOf(ch: Int) = ch / RigLimits.BONE_CHANS
     fun boneChanOf(ch: Int) = ch % RigLimits.BONE_CHANS
     fun curveOf(ch: Int) = (ch - RigLimits.CURVE_BASE) / RigLimits.CURVE_CHANS
@@ -84,6 +101,16 @@ data class Bone(
 /** Control point of a deform curve. [rx],[ry] rest position, [bone] it follows (-1 = free), [dx],[dy],[thick] static pose values. */
 @Immutable
 data class CtlPoint(val rx: Float, val ry: Float, val bone: Int = -1, val dx: Float = 0f, val dy: Float = 0f, val thick: Float = 1f)
+
+/** Puppet-warp pin. [rx],[ry] rest position (layer paper units), [dx],[dy] static offset used while the channel has no keys. */
+@Immutable
+data class Pin(
+    val rx: Float, val ry: Float, val dx: Float = 0f, val dy: Float = 0f,
+    /** Static rotation (degrees clockwise) used while the rotation channel has no keys. */
+    val rot: Float = 0f,
+    /** Influence multiplier in the warp weights: 0.2 soft .. 4 dominant. */
+    val stiff: Float = 1f,
+)
 
 /** Catmull-Rom spline through [pts]. Picture within [reach] of the rest curve bends with it; [softness] = fade width. [mix] = deform amount. */
 @Immutable
@@ -126,8 +153,11 @@ data class Rig(
     val rect: MeshRect = MeshRect(),
     val keys: List<ChanKey> = emptyList(),
     val paint: WeightPaint? = null,
+    val pins: List<Pin> = emptyList(),
+    /** Puppet-warp reach: 1 = wide, 2 = medium, 3 = tight (MLS weight exponent). */
+    val warpFalloff: Int = 2,
 ) {
-    val isEmpty: Boolean get() = bones.isEmpty() && curves.isEmpty()
+    val isEmpty: Boolean get() = bones.isEmpty() && curves.isEmpty() && pins.isEmpty()
     val vertCount: Int get() = (grid + 1) * (grid + 1)
 
     /** Flat row blob for native (layout: fox_rig.h). Built once per immutable copy. */
@@ -140,11 +170,13 @@ data class Rig(
         val ctlCount = curves.sumOf { it.pts.size }
         val a = FloatArray(
             RigLimits.ROW_HEAD + bones.size * RigLimits.BONE_STRIDE + curves.size * RigLimits.CURVE_HEAD +
-                ctlCount * RigLimits.CTL_STRIDE + sorted.size * KEY_STRIDE + (p?.data?.size ?: 0)
+                ctlCount * RigLimits.CTL_STRIDE +
+                (if (pins.isEmpty()) 0 else RigLimits.PIN_HEAD + pins.size * RigLimits.PIN_STRIDE) + sorted.size * KEY_STRIDE + (p?.data?.size ?: 0)
         )
         a[0] = bones.size.toFloat(); a[1] = curves.size.toFloat(); a[2] = grid.toFloat()
         a[3] = rect.l; a[4] = rect.t; a[5] = rect.r; a[6] = rect.b
         a[7] = sorted.size.toFloat(); a[8] = (p?.data?.size ?: 0).toFloat()
+        a[9] = pins.size.toFloat()
         var o = RigLimits.ROW_HEAD
         for (b in bones) {
             a[o] = b.parent.toFloat(); a[o + 1] = b.hx; a[o + 2] = b.hy; a[o + 3] = b.angle; a[o + 4] = b.len
@@ -160,6 +192,11 @@ data class Rig(
                 a[o] = t.rx; a[o + 1] = t.ry; a[o + 2] = t.bone.toFloat(); a[o + 3] = t.dx; a[o + 4] = t.dy; a[o + 5] = t.thick
                 o += RigLimits.CTL_STRIDE
             }
+        }
+        if (pins.isNotEmpty()) {
+            a[o] = warpFalloff.coerceIn(1, 3).toFloat(); a[o + 1] = 0f
+            o += RigLimits.PIN_HEAD
+            for (t in pins) { a[o] = t.rx; a[o + 1] = t.ry; a[o + 2] = t.dx; a[o + 3] = t.dy; a[o + 4] = t.rot; a[o + 5] = t.stiff; o += RigLimits.PIN_STRIDE }
         }
         for (k in sorted) { k.writeTo(a, o); o += KEY_STRIDE }
         if (p != null) { p.data.copyInto(a, o) }
@@ -187,6 +224,11 @@ data class Rig(
             val c = BoneChan.values()[RigChan.boneChanOf(chan)]
             return copy(bones = bones.toMutableList().also { it[b] = it[b].withBase(c, value) })
         }
+        if (RigChan.isPin(chan)) {
+            val i = RigChan.pinOf(chan)
+            val p = pins.getOrNull(i) ?: return this
+            return copy(pins = pins.toMutableList().also { it[i] = when (RigChan.pinSlot(chan)) { 0 -> p.copy(dx = value); 1 -> p.copy(dy = value); else -> p.copy(rot = value) } })
+        }
         val k = RigChan.curveOf(chan)
         if (k !in curves.indices) return this
         val slot = RigChan.curveSlot(chan)
@@ -205,6 +247,10 @@ data class Rig(
     /** Static value of a channel as stored (not the animated one). */
     fun baseOf(chan: Int): Float {
         if (RigChan.isBone(chan)) return bones.getOrNull(RigChan.boneOf(chan))?.base?.get(RigChan.boneChanOf(chan)) ?: 0f
+        if (RigChan.isPin(chan)) {
+            val p = pins.getOrNull(RigChan.pinOf(chan)) ?: return 0f
+            return when (RigChan.pinSlot(chan)) { 0 -> p.dx; 1 -> p.dy; else -> p.rot }
+        }
         val cv = curves.getOrNull(RigChan.curveOf(chan)) ?: return 0f
         val slot = RigChan.curveSlot(chan)
         if (slot == 0) return cv.mix
@@ -320,7 +366,7 @@ data class Rig(
     fun removeCurve(k: Int): Rig {
         if (k !in curves.indices) return this
         val nk = keys.mapNotNull { key ->
-            if (RigChan.isBone(key.chan)) key else {
+            if (RigChan.isBone(key.chan) || RigChan.isPin(key.chan)) key else {
                 val c = RigChan.curveOf(key.chan)
                 when {
                     c == k -> null
@@ -338,7 +384,7 @@ data class Rig(
         if (c.pts.size >= RigLimits.MAX_CTL) return this
         val i = at.coerceIn(0, c.pts.size)
         val nk = keys.map { key ->
-            if (RigChan.isBone(key.chan) || RigChan.curveOf(key.chan) != k) key else {
+            if (RigChan.isBone(key.chan) || RigChan.isPin(key.chan) || RigChan.curveOf(key.chan) != k) key else {
                 val slot = RigChan.curveSlot(key.chan)
                 if (slot == 0) key else {
                     val idx = (slot - 1) / 3
@@ -353,7 +399,7 @@ data class Rig(
         val c = curves.getOrNull(k) ?: return this
         if (i !in c.pts.indices) return this
         val nk = keys.mapNotNull { key ->
-            if (RigChan.isBone(key.chan) || RigChan.curveOf(key.chan) != k) key else {
+            if (RigChan.isBone(key.chan) || RigChan.isPin(key.chan) || RigChan.curveOf(key.chan) != k) key else {
                 val slot = RigChan.curveSlot(key.chan)
                 if (slot == 0) key else {
                     val idx = (slot - 1) / 3
@@ -370,6 +416,40 @@ data class Rig(
 
     fun withCtl(k: Int, i: Int, f: (CtlPoint) -> CtlPoint): Rig =
         withCurve(k) { c -> if (i !in c.pts.indices) c else c.copy(pts = c.pts.toMutableList().also { it[i] = f(it[i]) }) }
+
+    // ------------------------------------------------------------------ puppet warp pins
+
+    fun addPin(x: Float, y: Float): Rig =
+        if (pins.size >= RigLimits.MAX_PINS) this else copy(pins = pins + Pin(x, y))
+
+    /** Moves the REST position of pin [i] (Build mode). */
+    fun movePin(i: Int, x: Float, y: Float): Rig =
+        if (i !in pins.indices) this else copy(pins = pins.toMutableList().also { it[i] = it[i].copy(rx = x, ry = y) })
+
+    /** Removes pin [i]; its keys go, later pins' keys shift down. */
+    fun removePin(i: Int): Rig {
+        if (i !in pins.indices) return this
+        val nk = keys.mapNotNull { key ->
+            if (!RigChan.isPin(key.chan)) key else {
+                val p = RigChan.pinOf(key.chan)
+                when {
+                    p == i -> null
+                    p > i -> key.copy(chan = key.chan - if (RigChan.isPinRot(key.chan)) 1 else RigLimits.PIN_CHANS)
+                    else -> key
+                }
+            }
+        }
+        return copy(pins = pins.filterIndexed { j, _ -> j != i }, keys = nk)
+    }
+
+    /** Drops every pin and its keys. */
+    fun clearPins(): Rig = copy(pins = emptyList(), keys = keys.filter { !RigChan.isPin(it.chan) })
+
+    /** Influence of pin [i] in the warp (0.2 soft .. 4 dominant). */
+    fun withPinStiff(i: Int, v: Float): Rig =
+        if (i !in pins.indices) this else copy(pins = pins.toMutableList().also { it[i] = it[i].copy(stiff = v.coerceIn(0.2f, 4f)) })
+
+    fun withWarpFalloff(f: Int): Rig = copy(warpFalloff = f.coerceIn(1, 3))
 
     // ------------------------------------------------------------------ mesh + weights
 
@@ -469,7 +549,11 @@ class CurvePose(val pts: FloatArray, val samples: FloatArray) {
 }
 
 /** Geometry of a rig at one moment (from native). Bones: head / tail. [chv] = every channel value (keys applied). */
-class RigPose(val bones: FloatArray, val curves: List<CurvePose>, val chv: FloatArray) {
+class RigPose(val bones: FloatArray, val curves: List<CurvePose>, val chv: FloatArray, val pins: FloatArray = FloatArray(0)) {
+    val pinCount: Int get() = pins.size / 2
+    /** Current (posed) pin position. */
+    fun pinX(i: Int) = pins[i * 2]
+    fun pinY(i: Int) = pins[i * 2 + 1]
     val boneCount: Int get() = bones.size / 4
     fun hx(b: Int) = bones[b * 4]
     fun hy(b: Int) = bones[b * 4 + 1]
@@ -502,8 +586,13 @@ fun parseRigPose(a: FloatArray): RigPose? {
         o += ns * 2
         curves.add(CurvePose(pts, samples))
     }
+    if (o >= a.size) return null
+    val nP = a[o++].toInt()
+    if (nP < 0 || o + nP * 2 > a.size) return null
+    val pins = a.copyOfRange(o, o + nP * 2)
+    o += nP * 2
     if (o + RigLimits.TOTAL_CHANS > a.size) return null
-    return RigPose(bones, curves, a.copyOfRange(o, o + RigLimits.TOTAL_CHANS))
+    return RigPose(bones, curves, a.copyOfRange(o, o + RigLimits.TOTAL_CHANS), pins)
 }
 
 fun minMax(v: Float, lo: Float, hi: Float) = min(hi, max(lo, v))

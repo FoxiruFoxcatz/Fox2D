@@ -9,7 +9,9 @@
         android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission 
         android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-feature android:glEsVersion="0x00030002" 
     	android:required="true" />
     <application
@@ -19,6 +21,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
+        android:requestLegacyExternalStorage="true"
         android:theme="@style/Theme.Fox2D.Splash">
         <activity
             android:name=".MainActivity"

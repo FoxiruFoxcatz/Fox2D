@@ -40,6 +40,8 @@ import kotlin.math.min
 //   Bone  / Paint         : brush the weight of the selected bone (heat map)
 //   Deform/ Build         : tap = add control point, drag point = move it
 //   Deform/ Pose          : drag a control point = keyed offset
+//   Warp  / Build         : tap = add pin, drag pin = move its rest position
+//   Warp  / Pose          : drag a pin = keyed offset (the picture follows, rigid MLS)
 //   empty space / 2 fingers : pan, zoom, twist the view
 // Every gesture is ONE undo step.
 // ======================================================================================================
@@ -50,6 +52,9 @@ private sealed interface RHit {
     data class Body(val b: Int) : RHit
     data class Ik(val b: Int) : RHit
     data class Ctl(val k: Int, val i: Int) : RHit
+    data class Pin(val i: Int) : RHit
+    /** Rotation handle of the selected pin (Pose mode). */
+    data class PinRot(val i: Int) : RHit
     object None : RHit
 }
 
@@ -97,8 +102,29 @@ private fun pickOther(state: EditorState, m: PaperMap, rest: Boolean, p: Offset,
     return best
 }
 
+/** Layer position of the rotation handle of pin [i]: a short arm from the pin, pointing "up" turned by the pin's rotation. */
+private const val PIN_HANDLE = 0.06f
+private fun pinHandle(pose: RigPose, i: Int): Offset {
+    val th = Math.toRadians(pose.value(RigChan.pinRot(i)).toDouble())
+    return Offset(pose.pinX(i) + kotlin.math.sin(th).toFloat() * PIN_HANDLE, pose.pinY(i) - kotlin.math.cos(th).toFloat() * PIN_HANDLE)
+}
+
 private fun hitTest(state: EditorState, pose: RigPose, rig: Rig, ctx: RCtx, p: Offset, r: Float): RHit {
     val ui = state.rigUi
+    if (state.tool == Tool.Warp) {
+        if (ui.mode == RigMode.Pose && ui.pin in 0 until pose.pinCount) {
+            val h = ctx.screen(pinHandle(pose, ui.pin))
+            if ((h - p).getDistance() < r) return RHit.PinRot(ui.pin)
+        }
+        var best: RHit = RHit.None
+        var bd = r
+        // the selected pin wins near-ties; later pins sit on top of earlier ones
+        for (i in pose.pinCount - 1 downTo 0) {
+            val d = (ctx.screen(Offset(pose.pinX(i), pose.pinY(i))) - p).getDistance() + if (i == ui.pin) -r * 0.1f else 0f
+            if (d < bd) { bd = d; best = RHit.Pin(i) }
+        }
+        return best
+    }
     if (state.tool == Tool.Deform) {
         var best: RHit = RHit.None
         var bd = r
@@ -179,7 +205,7 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val tr = state.activeTrack
                     val tool = state.tool
-                    val md = state.rigUi.mode.let { if (tool == Tool.Deform && it == RigMode.Paint) RigMode.Build else it }
+                    val md = state.rigUi.mode.let { if ((tool == Tool.Deform || tool == Tool.Warp) && it == RigMode.Paint) RigMode.Build else it }
                     val locked = state.activeLocked
                     val rig0 = state.trackRig(tr)
                     val xf0 = state.trackXf(tr)
@@ -198,6 +224,7 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                             RigMode.Paint -> state.rigUi.bone in rig0.bones.indices
                         }
                         Tool.Deform -> hit is RHit.Ctl
+                        Tool.Warp -> hit is RHit.Pin || hit is RHit.PinRot
                         else -> false
                     }
 
@@ -322,6 +349,16 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                                     state.setRig(tr) { r -> r.withCtl(hit.k, hit.i) { p -> p.copy(rx = q.x, ry = q.y) } }
                                     changed = true
                                 }
+                                tool == Tool.Warp && md == RigMode.Build && hit is RHit.Pin -> {
+                                    state.setRig(tr) { r -> r.movePin(hit.i, q.x, q.y) }
+                                    changed = true
+                                }
+                                tool == Tool.Warp && md == RigMode.Pose && hit is RHit.Pin -> {
+                                    state.posePinMove(tr, hit.i, d); changed = true
+                                }
+                                tool == Tool.Warp && md == RigMode.Pose && hit is RHit.PinRot -> {
+                                    state.posePinRotate(tr, hit.i, q); changed = true
+                                }
                                 tool == Tool.Deform && md == RigMode.Pose && hit is RHit.Ctl -> {
                                     state.poseCtlMove(tr, hit.k, hit.i, d); changed = true
                                 }
@@ -358,6 +395,12 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                             tool == Tool.Bone && hit is RHit.Body -> state.rigUi.bone = hit.b
                             tool == Tool.Bone && hit is RHit.Ik -> state.rigUi.bone = hit.b
                             tool == Tool.Deform && hit is RHit.Ctl -> { state.rigUi.curve = hit.k; state.rigUi.ctl = hit.i }
+                            tool == Tool.Warp && hit is RHit.Pin -> state.rigUi.pin = hit.i
+                            // Build: a tap on empty paper pins the picture there
+                            tool == Tool.Warp && md == RigMode.Build && !locked -> {
+                                state.addWarpPin(tr, up)
+                                changed = false   // addWarpPin is its own undo step
+                            }
                             // a tap on a dimmed bone of ANOTHER track switches to that track and bone
                             otherPick != null -> {
                                 state.activeTrack = otherPick.first
@@ -436,6 +479,46 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                         drawCircle(Color.Black.copy(alpha = 0.55f), 9.5f * dp, p)
                         drawCircle(if (isSel) KeyGold else col, 7f * dp, p, style = if (bound >= 0) androidx.compose.ui.graphics.drawscope.Fill else Stroke(2.2f * dp))
                         if (isSel) drawCircle(Color.White, 10.5f * dp, p, style = Stroke(1.6f * dp))
+                    }
+                }
+            }
+        }
+
+        // ---- puppet warp: mesh box and pins ----
+        if (state.tool == Tool.Warp) {
+            val r = rig.rect
+            if (rig.pins.isNotEmpty() && (r.r > r.l) && (r.b > r.t)) {
+                val a = ctx.screen(Offset(r.l, r.t)); val b = ctx.screen(Offset(r.r, r.t))
+                val c = ctx.screen(Offset(r.r, r.b)); val d = ctx.screen(Offset(r.l, r.b))
+                val box = Path().apply { moveTo(a.x, a.y); lineTo(b.x, b.y); lineTo(c.x, c.y); lineTo(d.x, d.y); close() }
+                drawPath(box, Color.White.copy(alpha = 0.35f), style = Stroke(1.2f * dp, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(8f * dp, 6f * dp))))
+            }
+            if (pose != null) {
+                for (i in 0 until pose.pinCount) {
+                    val p = ctx.screen(Offset(pose.pinX(i), pose.pinY(i)))
+                    val isSel = i == ui.pin
+                    val pin = rig.pins.getOrNull(i)
+                    if (mode == RigMode.Pose && pin != null) {
+                        // where the pin was glued: ring + a line to where it was pulled
+                        val rp = ctx.screen(Offset(pin.rx, pin.ry))
+                        if ((rp - p).getDistance() > 2f * dp) {
+                            drawLine(Color.White.copy(alpha = 0.55f), rp, p, 1.5f * dp)
+                            drawCircle(Color.White.copy(alpha = 0.7f), 5f * dp, rp, style = Stroke(1.5f * dp))
+                        }
+                    }
+                    val col = if (isSel) KeyGold else cs.primary
+                    val keyed = rig.keys.any { it.chan == RigChan.pin(i, 0) || it.chan == RigChan.pin(i, 1) }
+                    drawCircle(Color.Black.copy(alpha = 0.6f), 11f * dp, p)
+                    drawCircle(col, 8.5f * dp, p)
+                    drawCircle(Color.White, 3f * dp, p)
+                    if (keyed) drawCircle(KeyGold, 12.5f * dp, p, style = Stroke(1.8f * dp))
+                    if (isSel) drawCircle(Color.White, 14f * dp, p, style = Stroke(1.6f * dp))
+                    if (isSel && mode == RigMode.Pose) {   // rotation handle: drag it around the pin
+                        val hp = ctx.screen(pinHandle(pose, i))
+                        drawLine(Color.White.copy(alpha = 0.8f), p, hp, 1.6f * dp)
+                        drawCircle(Color.Black.copy(alpha = 0.6f), 10f * dp, hp)
+                        drawCircle(KeyGold, 7f * dp, hp)
+                        drawCircle(Color.White, 2.5f * dp, hp)
                     }
                 }
             }

@@ -37,18 +37,32 @@ class RigUiState {
     var bone by mutableIntStateOf(-1)
     var curve by mutableIntStateOf(-1)
     var ctl by mutableIntStateOf(-1)
+    /** Selected puppet-warp pin (Tool.Warp). */
+    var pin by mutableIntStateOf(-1)
     /** Pose edits create / update a key at the playhead even when the channel has no keys yet. */
     var autoKey by mutableStateOf(true)
     var showWeights by mutableStateOf(true)
     var brushRadius by mutableFloatStateOf(0.08f)
     var brushStrength by mutableFloatStateOf(0.5f)
     var erase by mutableStateOf(false)
+    /** Draw the mesh of the edited row as lines, in the native canvas shader. */
+    var meshLines by mutableStateOf(false)
+    /** Puppet Warp "Fit to image": which pixels of the picked picture form the outline ([FitShape.id]) and whether it keeps its aspect. */
+    var fitShape by mutableIntStateOf(0)
+    var fitUniform by mutableStateOf(false)
+    /** Outline-following triangle meshes by drawing-track id (see RigFit.kt). Session only: not saved with the project yet. */
+    val tri = HashMap<Int, TriMeshData>()
+    /** 0 = coarse, 1 = medium, 2 = fine. */
+    var triDensity by mutableIntStateOf(1)
 }
 
-val EditorState.rigOpen: Boolean get() = tool == Tool.Bone || tool == Tool.Deform
+val EditorState.rigOpen: Boolean get() = tool == Tool.Bone || tool == Tool.Deform || tool == Tool.Warp
 
 /** The canvas shows the REST picture while bones / curves are being built or weights painted. */
 val EditorState.rigPosedView: Boolean get() = !rigOpen || rigUi.mode == RigMode.Pose
+
+/** Timeline row of [track] as native numbers it (same order as the rig set). */
+fun EditorState.nativeRowOf(track: Int) = drawTracks.indexOfFirst { it.id == track }
 
 private fun EditorState.rowOf(track: Int) = drawTracks.indexOfFirst { it.id == track }
 
@@ -64,23 +78,25 @@ fun EditorState.setRig(track: Int, f: (Rig) -> Rig) {
 fun EditorState.rigPose(track: Int = activeTrack, rest: Boolean = false): RigPose? {
     val t = drawTracks.firstOrNull { it.id == track } ?: return null
     if (t.rig.isEmpty) return null
-    return parseRigPose(NativeCanvas.evalRig(t.rig.packed, localFrame(track).toFloat(), rest))
+    return parseRigPose(NativeCanvas.evalRig(t.rig.packed, localTime(track), rest))
 }
 
 /** Every row's rig -> native (the canvas deforms with it; the exporter gets the same blob). */
 fun EditorState.syncRig() {
-    NativeCanvas.setRig(packRigs(drawTracks.toList()))
+    NativeCanvas.setRig(packRigs(liveRows()))   // rig keys re-timed like the transform keys (see EditorState.liveRows)
     NativeCanvas.setAttach(packAttach(drawTracks.toList()))
     NativeCanvas.setRigPosed(rigPosedView)
+    syncTriMeshes()
 }
 
 fun EditorState.selectRigTool(t: Tool) {
+    cancelPlacing()
     playing = false
     transformOpen = false
     panel = Panel.None
     timeline.selectedClip = -1
     tool = t
-    if (t == Tool.Deform && rigUi.mode == RigMode.Paint) rigUi.mode = RigMode.Build   // weights belong to the bone tool
+    if ((t == Tool.Deform || t == Tool.Warp) && rigUi.mode == RigMode.Paint) rigUi.mode = RigMode.Build   // weights belong to the bone tool
     normalizeRigSel()
 }
 
@@ -90,6 +106,7 @@ fun EditorState.normalizeRigSel() {
     if (rigUi.bone !in r.bones.indices) rigUi.bone = if (r.bones.isEmpty()) -1 else 0
     if (rigUi.curve !in r.curves.indices) { rigUi.curve = if (r.curves.isEmpty()) -1 else 0; rigUi.ctl = -1 }
     else if (rigUi.ctl !in r.curves[rigUi.curve].pts.indices) rigUi.ctl = -1
+    if (rigUi.pin !in r.pins.indices) rigUi.pin = if (r.pins.isEmpty()) -1 else 0
 }
 
 /** Layer-space point under a shown (already row-transform-inverted) touch: undoes the rig deformation. */
@@ -100,7 +117,7 @@ fun EditorState.unwarp(track: Int, q: Offset): Offset {
     return Offset(r[0], r[1])
 }
 
-/** Mesh = box of the drawing (+ margin), clipped to the paper. Content outside the mesh is not drawn while the rig is active. */
+/** Mesh = box of the drawing (+ margin), clipped to the paper. Ink drawn outside the box later still bends with the nearest edge of the mesh (native extension ring); re-fit to include it in the mesh proper. */
 fun EditorState.fitMeshToDrawing(track: Int = activeTrack, grid: Int? = null) = edit {
     val b = trackBounds(track)
     val m = 0.06f
@@ -303,7 +320,7 @@ fun EditorState.resetRigPose(track: Int) = edit {
 fun EditorState.clearRig(track: Int = activeTrack) = edit {
     setRig(track) { Rig() }
     for (i in drawTracks.indices) if (drawTracks[i].attach?.track == track) drawTracks[i] = drawTracks[i].copy(attach = null)
-    rigUi.bone = -1; rigUi.curve = -1; rigUi.ctl = -1
+    rigUi.bone = -1; rigUi.curve = -1; rigUi.ctl = -1; rigUi.pin = -1
     if (kfOpen is PropRef.RigChannel) kfOpen = null
 }
 
@@ -513,6 +530,72 @@ fun EditorState.poseCtlMove(track: Int, curve: Int, ctl: Int, d: Offset) {
     setRigChan(track, cx, pose.value(cx) + d.x)
     setRigChan(track, cy, pose.value(cy) + d.y)
 }
+
+/** Offset puppet-warp pin [pin] by [d] (layer units): keys its dx / dy. */
+fun EditorState.posePinMove(track: Int, pin: Int, d: Offset) {
+    val pose = rigPose(track) ?: return
+    if (pin !in 0 until pose.pinCount) return
+    val cx = RigChan.pin(pin, 0); val cy = RigChan.pin(pin, 1)
+    setRigChan(track, cx, pose.value(cx) + d.x)
+    setRigChan(track, cy, pose.value(cy) + d.y)
+}
+
+/**
+ * Rotate pin [pin] so its handle points at layer point [target]: keys (or sets) the pin's rotation channel. Follows the finger
+ * by the shortest way round each step, so you can keep turning past 180 degrees.
+ */
+fun EditorState.posePinRotate(track: Int, pin: Int, target: Offset) {
+    val pose = rigPose(track) ?: return
+    if (pin !in 0 until pose.pinCount) return
+    val ch = RigChan.pinRot(pin)
+    val cur = pose.value(ch)
+    val aim = Math.toDegrees(kotlin.math.atan2((target.y - pose.pinY(pin)).toDouble(), (target.x - pose.pinX(pin)).toDouble())) + 90.0
+    val delta = ((aim - cur + 540.0) % 360.0 + 360.0) % 360.0 - 180.0
+    setRigChan(track, ch, cur + delta.toFloat())
+}
+
+/** Pins back to rest: offsets return to 0 (keyed channels get a zero key at the playhead). One undo step. [only] = a single pin. */
+fun EditorState.resetPins(track: Int, only: Int = -1) = edit {
+    val n = trackRig(track).pins.size
+    for (i in 0 until n) {
+        if (only >= 0 && i != only) continue
+        for (ch in intArrayOf(RigChan.pin(i, 0), RigChan.pin(i, 1), RigChan.pinRot(i))) {
+            val has = trackRig(track).keys.any { it.chan == ch }
+            if (has || rigUi.autoKey) { if (kotlin.math.abs(rigValue(track, ch)) > 1e-6f) rigPutKey(track, ch, 0f) }
+            else setRig(track) { it.withBase(ch, 0f) }
+        }
+    }
+}
+
+/** Add a pin at layer point [p]; makes sure the mesh exists (fits to the drawing the first time). One undo step. */
+fun EditorState.addWarpPin(track: Int, p: Offset) = edit {
+    val r = trackRig(track)
+    if (r.pins.size >= RigLimits.MAX_PINS) return@edit
+    if (r.bones.isEmpty() && r.curves.isEmpty() && r.pins.isEmpty()) {
+        val b = trackBounds(track)
+        val m = 0.06f
+        val rect = if (b == null) MeshRect() else MeshRect(
+            (b.left - m).coerceAtLeast(0f), (b.top - m).coerceAtLeast(0f), (b.right + m).coerceAtMost(1f), (b.bottom + m).coerceAtMost(1f),
+        )
+        setRig(track) { it.withMesh(it.grid, rect) }
+    }
+    setRig(track) { it.addPin(p.x, p.y) }
+    rigUi.pin = trackRig(track).pins.size - 1
+}
+
+fun EditorState.removeWarpPin(track: Int, i: Int) = edit {
+    setRig(track) { it.removePin(i) }
+    if (kfOpen is PropRef.RigChannel) kfOpen = null
+    normalizeRigSel()
+}
+
+fun EditorState.clearWarpPins(track: Int) = edit {
+    setRig(track) { it.clearPins() }
+    if (kfOpen is PropRef.RigChannel) kfOpen = null
+    rigUi.pin = -1
+}
+
+fun EditorState.setWarpFalloff(track: Int, f: Int) = edit { setRig(track) { it.withWarpFalloff(f) } }
 
 /** Snap for a dragged HEAD of bone [b]: the nearest tail of an earlier bone within [r] (layer units). Returns (tail point, that bone). */
 fun Rig.snapHead(b: Int, p: Offset, r: Float): Pair<Offset, Int>? {

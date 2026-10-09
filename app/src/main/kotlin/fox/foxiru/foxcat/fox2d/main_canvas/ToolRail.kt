@@ -59,7 +59,7 @@ import kotlin.math.roundToInt
  * Space the docked tool rail takes on [side] (thickness + gap); 0 when the rail sits on another edge.
  * Other floating chrome (TrackToolbar, ViewChip) adds this to its padding so nothing overlaps the rail.
  */
-internal fun EditorState.railInset(side: ToolbarDock): Dp = if (railDock == side) 52.dp else 0.dp
+internal fun EditorState.railInset(side: ToolbarDock): Dp = if (railDock == side) 46.dp else 0.dp
 
 /** The rail runs along a vertical edge (Left / Right) -> its buttons stack in a column. */
 private val ToolbarDock.runsVertical: Boolean get() = this == ToolbarDock.Left || this == ToolbarDock.Right
@@ -229,7 +229,7 @@ private fun RailBody(state: EditorState, dock: ToolbarDock, dragging: Boolean, d
     ) {
         val scroll = rememberScrollState()
         if (col) {
-            Column(Modifier.width(48.dp).padding(bottom = 4.dp).animateContentSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(Modifier.width(42.dp).padding(bottom = 2.dp).animateContentSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 RailGrip(true, dragging, grip)
                 Column(
                     Modifier.weight(1f, fill = false).verticalScroll(scroll),
@@ -237,7 +237,7 @@ private fun RailBody(state: EditorState, dock: ToolbarDock, dragging: Boolean, d
                 ) { RailItems(state, true, dock) }
             }
         } else {
-            Row(Modifier.height(48.dp).padding(end = 4.dp).animateContentSize(), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.height(42.dp).padding(end = 2.dp).animateContentSize(), verticalAlignment = Alignment.CenterVertically) {
                 RailGrip(false, dragging, grip)
                 Row(
                     Modifier.weight(1f, fill = false).horizontalScroll(scroll),
@@ -255,7 +255,7 @@ private fun RailGrip(col: Boolean, active: Boolean, modifier: Modifier) {
     val tint by animateColorAsState(if (active) cs.primary else cs.onSurfaceVariant.copy(alpha = 0.55f), label = "grip")
     Box(
         modifier
-            .size(if (col) 48.dp else 22.dp, if (col) 22.dp else 48.dp)
+            .size(if (col) 42.dp else 18.dp, if (col) 18.dp else 42.dp)
             .semantics { contentDescription = "Drag to move the toolbar" },
         contentAlignment = Alignment.Center,
     ) {
@@ -272,13 +272,17 @@ private fun RailGrip(col: Boolean, active: Boolean, modifier: Modifier) {
 @Composable
 private fun Axis(col: Boolean, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     if (col) {
-        Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) { content() }
+        Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(0.dp)) { content() }
     } else {
-        Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) { content() }
+        Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(0.dp)) { content() }
     }
 }
 
-/** [Brush, colour] - fold handle - [Deform, Bone, Transform, Layers]; same actions as the old side rail. */
+/** Compact rail: buttons are 36 dp (the rest of the UI keeps 40 dp), the fold handle 28 dp, groups 2 dp apart. */
+private val RailBtn = 36.dp
+private val RailChevron = 28.dp
+
+/** [Brush, colour] - fold handle - [Deform, Bone, Puppet Warp pin, Transform, Layers]. */
 @Composable
 private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
     val cs = MaterialTheme.colorScheme
@@ -293,8 +297,8 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
     val arrow by animateFloatAsState(base + if (open) 0f else 180f, label = "arrow")
 
     AnimatedVisibility(open, enter = fadeIn(), exit = fadeOut()) {
-        Axis(col, if (col) Modifier.padding(bottom = 10.dp) else Modifier.padding(end = 10.dp)) {
-            ToolBtn(state.brush.ico, state.brush.label, state.tool == Tool.Brush) {
+        Axis(col, if (col) Modifier.padding(bottom = 2.dp) else Modifier.padding(end = 2.dp)) {
+            ToolBtn(state.brush.ico, state.brush.label, state.tool == Tool.Brush, RailBtn) {
                 // 1st tap selects the tool, tap again opens the brush picker
                 if (state.tool == Tool.Brush) {
                     state.panel = if (state.panel == Panel.Brush) Panel.None else Panel.Brush
@@ -302,12 +306,12 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
                     state.tool = Tool.Brush
                 }
             }
-            ColorSizeBtn(state)
+            ColorSizeBtn(state, RailBtn)
         }
     }
     Box(
         Modifier
-            .size(40.dp)
+            .size(RailChevron)
             .clip(RoundedCornerShape(14.dp))
             .clickable {
                 state.railOpen = !state.railOpen
@@ -319,13 +323,14 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
         FoxIcon(Ico.Chevron, Modifier.rotate(arrow), cs.onSurfaceVariant)
     }
     AnimatedVisibility(open, enter = fadeIn(), exit = fadeOut()) {
-        Axis(col, if (col) Modifier.padding(top = 10.dp) else Modifier.padding(start = 10.dp)) {
-            ToolBtn(Ico.Deform, "Deform", state.tool == Tool.Deform) { if (state.tool == Tool.Deform) state.tool = Tool.Brush else state.selectRigTool(Tool.Deform) }
-            ToolBtn(Ico.Bone, "Bone", state.tool == Tool.Bone) { if (state.tool == Tool.Bone) state.tool = Tool.Brush else state.selectRigTool(Tool.Bone) }
-            ToolBtn(Ico.Transform, "Transform", state.transformOpen) {
+        Axis(col, if (col) Modifier.padding(top = 2.dp) else Modifier.padding(start = 2.dp)) {
+            ToolBtn(Ico.Deform, "Deform", state.tool == Tool.Deform, RailBtn) { if (state.tool == Tool.Deform) state.tool = Tool.Brush else state.selectRigTool(Tool.Deform) }
+            ToolBtn(Ico.Bone, "Bone", state.tool == Tool.Bone, RailBtn) { if (state.tool == Tool.Bone) state.tool = Tool.Brush else state.selectRigTool(Tool.Bone) }
+            ToolBtn(Ico.Warp, "Puppet Warp pins", state.tool == Tool.Warp, RailBtn) { if (state.tool == Tool.Warp) state.tool = Tool.Brush else state.selectRigTool(Tool.Warp) }
+            ToolBtn(Ico.Transform, "Transform", state.transformOpen, RailBtn) {
                 if (state.transformOpen) state.transformOpen = false else state.openTransform()
             }
-            ToolBtn(Ico.Layers, "Layers", state.panel == Panel.Layers) {
+            ToolBtn(Ico.Layers, "Layers", state.panel == Panel.Layers, RailBtn) {
                 state.panel = if (state.panel == Panel.Layers) Panel.None else Panel.Layers
             }
         }

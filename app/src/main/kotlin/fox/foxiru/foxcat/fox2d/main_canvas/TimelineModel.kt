@@ -25,6 +25,10 @@ data class AudioClip(
     val gain: Float = 1f,
     /** Volume keys (SOURCE ms, sorted). Empty = constant [gain]. With keys the smooth envelope drives the volume. */
     val gainKeys: List<AudioKey> = emptyList(),
+    /** File name of the project's own copy of the audio (project/audio/<src>). Empty = not saved with a project. */
+    val src: String = "",
+    /** true = a copy made by a group's live Loop (rebuilt automatically; edit the original clip instead). */
+    val gen: Boolean = false,
 )
 
 /** Volume key. [ms] is SOURCE time (0 = start of the file) so trimming / splitting / moving a clip keeps keys on the sound. */
@@ -35,6 +39,8 @@ data class AudioTrack(
     val name: String,
     val muted: Boolean = false,
     val locked: Boolean = false,
+    /** Id of the TrackGroup (EditorScreen.kt) this layer sits in, -1 = top level. */
+    val group: Int = -1,
 )
 
 /**
@@ -106,6 +112,19 @@ class TimelineState {
     fun update(id: Int, f: (AudioClip) -> AudioClip) {
         val i = clips.indexOfFirst { it.id == id }
         if (i >= 0) clips[i] = f(clips[i])
+    }
+
+    /**
+     * Group drag: every clip in [base] (clip id -> start ms when the drag began) starts [dMs] later, in ONE pass over the
+     * table. Clips that do not move are not rewritten, so they do not invalidate the mixer sync / the timeline.
+     */
+    fun shiftClips(base: Map<Int, Long>, dMs: Long) {
+        for (i in clips.indices) {
+            val c = clips[i]
+            val st = base[c.id] ?: continue
+            val ns = max(0L, st + dMs)
+            if (ns != c.startMs) clips[i] = c.copy(startMs = ns)
+        }
     }
 
     // ---------------------------------------------------------------- volume keyframes (data here, curve in C++)
@@ -185,7 +204,7 @@ class TimelineState {
         val cut = playheadMs - c.startMs
         if (cut < MIN_CLIP_MS || c.lenMs - cut < MIN_CLIP_MS) return
         update(c.id) { it.copy(lenMs = cut) }
-        val right = c.copy(id = nextClipId(), startMs = playheadMs, inMs = c.inMs + cut, lenMs = c.lenMs - cut)
+        val right = c.copy(id = nextClipId(), gen = false, startMs = playheadMs, inMs = c.inMs + cut, lenMs = c.lenMs - cut)
         clips.add(right)
         selectedClip = right.id
     }
@@ -221,7 +240,7 @@ class TimelineState {
 
     fun duplicateSelected() {
         val c = clip(selectedClip) ?: return
-        val copy = c.copy(id = nextClipId(), startMs = c.startMs + c.lenMs)
+        val copy = c.copy(id = nextClipId(), startMs = c.startMs + c.lenMs, gen = false)
         clips.add(copy)
         selectedClip = copy.id
     }

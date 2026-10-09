@@ -20,7 +20,16 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.graphics.Bitmap
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import fox.foxiru.foxcat.fox2d.jnicallers.NativeCanvas
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -44,10 +53,18 @@ internal fun RigPanel(state: EditorState) {
     val track = state.activeTrack
     val rig = state.trackRig(track)
     val isBone = state.tool == Tool.Bone
+    val isWarp = state.tool == Tool.Warp
     val pending = remember { arrayOfNulls<EditSnap>(1) }
 
     // keep the selection valid when the row, the rig or the history changes
-    LaunchedEffect(track, rig.bones.size, rig.curves.size, state.tool) { state.normalizeRigSel() }
+    LaunchedEffect(track, rig.bones.size, rig.curves.size, rig.pins.size, state.tool) { state.normalizeRigSel() }
+
+    // "Lines": the mesh is drawn by the native canvas (GLSL); off again as soon as the panel closes
+    val meshRow = state.nativeRowOf(track)
+    DisposableEffect(ui.meshLines, meshRow) {
+        NativeCanvas.setMeshLines(ui.meshLines && meshRow >= 0, meshRow)
+        onDispose { NativeCanvas.setMeshLines(false, -1) }
+    }
 
     fun begin() { if (pending[0] == null) pending[0] = state.snapshot() }
     fun end() { pending[0]?.let { state.commitEdit(it) }; pending[0] = null }
@@ -59,7 +76,7 @@ internal fun RigPanel(state: EditorState) {
 
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(if (isBone) "Bones" else "Deform", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.titleMedium)
+            Text(if (isBone) "Bones" else if (isWarp) "Puppet Warp" else "Deform", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.titleMedium)
             FilterChip(mode == RigMode.Build, { ui.mode = RigMode.Build }, { Text("Build") })
             FilterChip(mode == RigMode.Pose, { ui.mode = RigMode.Pose }, { Text("Pose") })
             if (isBone) FilterChip(mode == RigMode.Paint, { ui.mode = RigMode.Paint }, { Text("Weights") })
@@ -83,6 +100,8 @@ internal fun RigPanel(state: EditorState) {
                 isBone && mode == RigMode.Build -> BoneBuild(state, track, rig, ::param, ::end)
                 isBone && mode == RigMode.Pose -> BonePose(state, track, rig, pose)
                 isBone -> BonePaint(state, track, rig)
+                isWarp && mode == RigMode.Build -> PinBuild(state, track, rig, ::param, ::end)
+                isWarp -> PinPose(state, track, rig, pose)
                 mode == RigMode.Build -> CurveBuild(state, track, rig, ::param, ::end)
                 else -> CurvePose(state, track, rig, pose)
             }
@@ -275,6 +294,69 @@ private fun BonePaint(state: EditorState, track: Int, rig: Rig) {
     RigSlider(state, null, "Strength", ui.brushStrength, 0.05f..1f, pct(ui.brushStrength), null, { ui.brushStrength = it }, end)
 }
 
+// ------------------------------------------------------------------------------------------------ puppet warp pins
+
+@Composable
+private fun PinChips(state: EditorState, rig: Rig) {
+    val ui = state.rigUi
+    ChipRow {
+        rig.pins.forEachIndexed { i, _ ->
+            val keyed = rig.keys.any { it.chan == RigChan.pin(i, 0) || it.chan == RigChan.pin(i, 1) || it.chan == RigChan.pinRot(i) }
+            FilterChip(ui.pin == i, { ui.pin = i }, { Text("Pin ${i + 1}" + if (keyed) " ◆" else "") })
+        }
+    }
+}
+
+@Composable
+private fun PinBuild(state: EditorState, track: Int, rig: Rig, param: ((Rig) -> Rig) -> Unit, end: () -> Unit) {
+    val ui = state.rigUi
+    Hint("Tap the picture to drop a pin. Pins hold the drawing in place; in Pose mode, drag one and the rest bends rigidly around the others. Drag a pin to move it.")
+    ChipRow {
+        Text("Reach", style = MaterialTheme.typography.labelMedium)
+        for ((f, n) in listOf(1 to "Wide", 2 to "Medium", 3 to "Tight")) FilterChip(rig.warpFalloff == f, { state.setWarpFalloff(track, f) }, { Text(n) })
+    }
+    OutlineMeshRow(state, track)
+    FitToImageRow(state, track)
+    ChipRow {
+        Text("Auto pins", style = MaterialTheme.typography.labelMedium)
+        for (n in intArrayOf(6, 10, 16, RigLimits.MAX_PINS)) TextButton(onClick = { state.autoPins(track, n) }) { Text("$n") }
+    }
+    if (rig.pins.isEmpty()) return
+    PinChips(state, rig)
+    ChipRow {
+        TextButton(onClick = { state.removeWarpPin(track, ui.pin) }, enabled = ui.pin in rig.pins.indices) { Text("Delete pin") }
+        TextButton(onClick = { state.clearWarpPins(track) }) { Text("Clear pins") }
+        TextButton(onClick = { state.fitMeshToDrawing() }) { Text("Fit mesh to drawing") }
+    }
+    val sel = ui.pin
+    if (sel in rig.pins.indices) {
+        val st = rig.pins[sel].stiff
+        RigSlider(state, null, "Pin ${sel + 1} · Influence", st, 0.2f..4f, "%.1f×".format(st), 1f, { v -> param { it.withPinStiff(sel, v) } }, end)
+    }
+    Hint("${rig.pins.size}/${RigLimits.MAX_PINS} pins. A pin you never move still works as an anchor. Influence: how far a pin's pull reaches (higher = stiffer area around it).")
+}
+
+@Composable
+private fun PinPose(state: EditorState, track: Int, rig: Rig, pose: RigPose?) {
+    val ui = state.rigUi
+    val (begin, end) = chanBegin(state)
+    if (rig.pins.isEmpty()) { Hint("Drop pins in Build first."); return }
+    PinChips(state, rig)
+    ChipRow {
+        Text("Auto-key", style = MaterialTheme.typography.labelMedium)
+        Switch(ui.autoKey, { ui.autoKey = it })
+        TextButton(onClick = { state.resetPins(track, ui.pin) }, enabled = ui.pin in rig.pins.indices) { Text("Reset pin") }
+        TextButton(onClick = { state.resetPins(track) }) { Text("Reset all") }
+    }
+    Hint("Drag a pin to move it; drag the yellow handle of the selected pin to rotate it (keyframeable, past 360° too). Unmoved pins stay put and hold the picture.")
+    val i = ui.pin
+    if (i !in rig.pins.indices) return
+    val n = "Pin ${i + 1}"
+    ChanSlider(state, track, RigChan.pin(i, 0), "$n · Offset X", pose, -0.5f..0.5f, 0f, ::pct, begin, end)
+    ChanSlider(state, track, RigChan.pin(i, 1), "$n · Offset Y", pose, -0.5f..0.5f, 0f, ::pct, begin, end)
+    ChanSlider(state, track, RigChan.pinRot(i), "$n · Rotation", pose, -360f..360f, 0f, ::deg, begin, end)
+}
+
 // ------------------------------------------------------------------------------------------------ curves
 
 @Composable
@@ -379,5 +461,46 @@ private fun MeshRow(state: EditorState, track: Int, rig: Rig) {
     ChipRow {
         Text("Mesh", style = MaterialTheme.typography.labelMedium)
         for (g in RigLimits.GRIDS) FilterChip(rig.grid == g, { state.setMeshGrid(track, g) }, { Text("$g") })
+        FilterChip(state.rigUi.meshLines, { state.rigUi.meshLines = !state.rigUi.meshLines }, { Text("Lines") })
     }
+}
+
+/** Puppet Warp: mesh that follows the drawing's outline (triangles), drawn as GPU lines. */
+@Composable
+private fun OutlineMeshRow(state: EditorState, track: Int) {
+    val ui = state.rigUi
+    var msg by remember { mutableStateOf<String?>(null) }
+    val m = ui.tri[track]
+    ChipRow {
+        Text("Outline mesh", style = MaterialTheme.typography.labelMedium)
+        for ((i, n) in listOf("Coarse", "Medium", "Fine").withIndex()) FilterChip(ui.triDensity == i, { ui.triDensity = i }, { Text(n) })
+        TextButton(onClick = { msg = if (state.generateOutlineMesh(track)) null else "Draw something first: the mesh is built around your drawing." }) { Text("Generate") }
+        if (m != null) TextButton(onClick = { state.clearOutlineMesh(track) }) { Text("Clear") }
+    }
+    Hint(msg ?: if (m != null) "${m.vertexCount} points, ${m.triangleCount} triangles. Lines on = the mesh is drawn on the canvas (chip Lines)." else "Builds triangles only where your drawing is, instead of a square grid.")
+}
+
+/** Puppet Warp: pick a picture, the drawing's outline is pulled onto the picture's outline (pins are created for you). */
+@Composable
+private fun FitToImageRow(state: EditorState, track: Int) {
+    val ui = state.rigUi
+    val ctx = LocalContext.current
+    var msg by remember { mutableStateOf<String?>(null) }
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val bm: Bitmap? = decodeFitBitmap(ctx, uri)
+        msg = when {
+            bm == null -> "Could not read that picture."
+            state.fitToImage(track, bm, FitShape.values()[ui.fitShape.coerceIn(0, 2)], ui.fitUniform) -> null
+            else -> "Nothing to fit: draw something first, or pick another outline (Alpha / Dark / Light)."
+        }
+        bm?.recycle()
+    }
+    ChipRow {
+        Text("Fit to image", style = MaterialTheme.typography.labelMedium)
+        for (f in FitShape.values()) FilterChip(ui.fitShape == f.ordinal, { ui.fitShape = f.ordinal }, { Text(f.label) })
+        FilterChip(ui.fitUniform, { ui.fitUniform = !ui.fitUniform }, { Text("Keep aspect") })
+        TextButton(onClick = { pick.launch("image/*") }) { Text("Pick image") }
+    }
+    Hint(msg ?: "Alpha = the visible part of the picture. Dark / Light = the dark or light pixels (for pictures without transparency).")
 }

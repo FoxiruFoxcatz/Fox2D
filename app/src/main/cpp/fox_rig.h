@@ -28,10 +28,18 @@
 //   curve k  mix                 : kCurveBase + k * kCurveChans
 //   curve k, control point i, c  : kCurveBase + k * kCurveChans + 1 + i * 3 + c      c = 0 dx, 1 dy, 2 thickness
 //
+// PUPPET WARP (pins)  - a third deformation source, applied on top of bones + curves
+//   Every pin has a rest position and a keyed offset (dx, dy); posed pin = rest + offset. Mesh vertices are moved by
+//   Moving Least Squares, RIGID variant (Schaefer et al. 2006): around each vertex the pins are weighted 1 / d^(2 * falloff),
+//   and the vertex follows the weighted rotation + translation of the pins. Pins that are not moved are anchors. The four
+//   corners of the mesh rect are implicit anchors, so a single pin bends its neighbourhood instead of dragging everything.
+//   channels: kPinBase + pin * kPinChans + (0 dx, 1 dy)
+//
 // ROW BLOB (float stream, see parseRow):
-//   [0] nBones [1] nCurves [2] grid cells per side [3..6] mesh rect l t r b [7] nKeys [8] nPaint [9] reserved
+//   [0] nBones [1] nCurves [2] grid cells per side [3..6] mesh rect l t r b [7] nKeys [8] nPaint [9] nPins
 //   bones  : nBones * kBoneStride   parent hx hy angDeg len radius falloff strength base[8] ikChain ikBend 0 0
 //   curves : per curve kCurveHead (nCtl reach softness baseMix 0 0 0 0) + nCtl * kCtlStride (rx ry bone bdx bdy bth)
+//   pins   : (only when nPins > 0) kPinHead (falloff 1..3, 0) + nPins * kPinStride (rx ry bdx bdy)
 //   keys   : nKeys * fox::anim::kKeyStride
 //   paint  : nPaint floats (= vertices * bones when valid): weight bias in -1..1
 // SET BLOB: [nRows, then per row: len, len floats]   (len 0 = row without rig)
@@ -56,7 +64,13 @@ constexpr int kMaxCurves = 8;
 constexpr int kMaxCtl = 16;
 constexpr int kCurveChans = 1 + 3 * kMaxCtl;
 constexpr int kCurveBase = kMaxBones * kBoneChans;
-constexpr int kTotalChans = kCurveBase + kMaxCurves * kCurveChans;
+constexpr int kMaxPins = 24;
+constexpr int kPinChans = 2;
+constexpr int kPinBase = kCurveBase + kMaxCurves * kCurveChans;
+constexpr int kPinRotBase = kPinBase + kMaxPins * kPinChans;   // pin rotation channels (degrees, clockwise), one per pin
+constexpr int kTotalChans = kPinRotBase + kMaxPins;
+constexpr int kPinStride = 6;
+constexpr int kPinHead = 2;
 constexpr int kBoneStride = 20;
 constexpr int kCtlStride = 6;
 constexpr int kCurveHead = 8;
@@ -134,6 +148,13 @@ struct Ctl {
     float bdx = 0.f, bdy = 0.f, bth = 1.f;   // static pose values (used while the channel has no keys)
 };
 
+struct Pin {
+    glm::vec2 rest{0.f};
+    float bdx = 0.f, bdy = 0.f;   // static offset (used while the channel has no keys)
+    float brot = 0.f;             // static rotation, degrees clockwise (used while the channel has no keys)
+    float stiff = 1.f;            // influence multiplier of this pin in the MLS weights (0.2 soft .. 4 dominant)
+};
+
 struct Curve {
     float reach = 0.15f, soft = 0.6f, baseMix = 1.f;
     std::vector<Ctl> ctl;
@@ -149,6 +170,8 @@ struct Rig {
     float l = 0.f, t = 0.f, r = 1.f, b = 1.f;
     std::vector<Bone> bones;
     std::vector<Curve> curves;
+    std::vector<Pin> pins;
+    int pinFalloff = 2;        // 1 = wide (soft), 2 = medium, 3 = tight
     std::vector<float> keys;
     int nKeys = 0;
     std::vector<float> paint;
@@ -224,13 +247,28 @@ inline bool parseRow(const float* d, size_t n, Rig& R) {
         }
     }
 
+    const int nPins = std::clamp((int) d[9], 0, kMaxPins);
+    if (nPins > 0) {
+        if (o + (size_t) kPinHead + (size_t) nPins * kPinStride > n) return false;
+        R.pinFalloff = std::clamp((int) std::lround(d[o]), 1, 3);
+        o += kPinHead;
+        R.pins.resize((size_t) nPins);
+        for (int i = 0; i < nPins; i++, o += kPinStride) {
+            Pin& P = R.pins[(size_t) i];
+            P.rest = glm::vec2(d[o], d[o + 1]);
+            P.bdx = d[o + 2]; P.bdy = d[o + 3];
+            P.brot = d[o + 4];
+            P.stiff = std::clamp(d[o + 5], 0.2f, 4.f);
+        }
+    }
+
     if (o + (size_t) nKeys * fox::anim::kKeyStride > n) return false;
     R.keys.assign(d + o, d + o + (size_t) nKeys * fox::anim::kKeyStride);
     R.nKeys = nKeys;
     o += (size_t) nKeys * fox::anim::kKeyStride;
 
     if (nPaint > 0 && o + nPaint <= n) R.paint.assign(d + o, d + o + nPaint);
-    R.valid = nB > 0 || nC > 0;
+    R.valid = nB > 0 || nC > 0 || nPins > 0;
     return true;
 }
 
@@ -440,6 +478,11 @@ inline void channelValues(const Rig& R, float local, std::vector<float>& chv) {
             chv[base + 3 + i * 3] = R.curves[k].ctl[i].bth;
         }
     }
+    for (size_t i = 0; i < R.pins.size(); i++) {
+        chv[(size_t) kPinBase + i * kPinChans] = R.pins[i].bdx;
+        chv[(size_t) kPinBase + i * kPinChans + 1] = R.pins[i].bdy;
+        chv[(size_t) kPinRotBase + i] = R.pins[i].brot;
+    }
     fox::anim::evalChannels(R.keys.data(), R.nKeys, local, chv.data(), kTotalChans);
 }
 
@@ -565,6 +608,81 @@ inline void smoothDisplacement(int grid, std::vector<float>& out) {
     for (int i = 0; i < W * W; i++) { out[(size_t) i * 4] = out[(size_t) i * 4 + 2] + t[(size_t) i * 2]; out[(size_t) i * 4 + 1] = out[(size_t) i * 4 + 3] + t[(size_t) i * 2 + 1]; }
 }
 
+// ------------------------------------------------------------------------------------------ puppet warp (pins)
+
+struct PinPt { glm::vec2 p, q; float k = 1.f; };   // rest, posed, influence
+
+// Rigid Moving Least Squares at [v]: weights w_i = 1 / |p_i - v|^(2 falloff); the weighted centroids give the translation and
+// the weighted Procrustes angle the rotation (angle from p-hat to q-hat). Interpolates: v on a pin returns that pin's q.
+inline glm::vec2 mlsRigid(const PinPt* pp, size_t n, int falloff, glm::vec2 v) {
+    float w[kMaxPins * 4 + 8];   // pins + 3 rotation helpers per pin + corners
+    float sw = 0.f;
+    // Weights 1/d^(2f) reach 1e27+ next to a pin: squaring them overflows float. So work with the nearest pin's distance as unit:
+    // w_i = (dmin2 / d2_i)^f in 0..1, which is the same field up to one constant factor.
+    float dmin2 = 1e30f;
+    for (size_t i = 0; i < n; i++) {
+        const glm::vec2 dl = pp[i].p - v;
+        const float d2 = dl.x * dl.x + dl.y * dl.y;
+        if (d2 < 1e-8f) return pp[i].q;
+        dmin2 = std::min(dmin2, d2);
+    }
+    glm::vec2 ps(0.f), qs(0.f);
+    for (size_t i = 0; i < n; i++) {
+        const glm::vec2 dl = pp[i].p - v;
+        const float d2 = dl.x * dl.x + dl.y * dl.y;
+        const float r = dmin2 / d2;
+        float wi = r;
+        for (int k = 1; k < falloff; k++) wi *= r;
+        wi *= pp[i].k;
+        w[i] = wi; sw += wi;
+    }
+    if (sw < 1e-20f) return v;
+    const float inv = 1.f / sw;
+    for (size_t i = 0; i < n; i++) { w[i] *= inv; ps += w[i] * pp[i].p; qs += w[i] * pp[i].q; }
+    float c = 0.f, s = 0.f;
+    for (size_t i = 0; i < n; i++) {
+        const glm::vec2 ph = pp[i].p - ps, qh = pp[i].q - qs;
+        c += w[i] * (ph.x * qh.x + ph.y * qh.y);
+        s += w[i] * (ph.x * qh.y - ph.y * qh.x);
+    }
+    const glm::vec2 a = v - ps;
+    const float nrm = std::sqrt(c * c + s * s);
+    glm::vec2 res = qs + a;
+    if (nrm > 1e-12f) { c /= nrm; s /= nrm; res = qs + glm::vec2(c * a.x - s * a.y, s * a.x + c * a.y); }
+    return (std::isfinite(res.x) && std::isfinite(res.y)) ? res : v;
+}
+
+// Pins + the four mesh-rect corners as fixed anchors. false = nothing moves (every pin at its rest position, no rotation).
+// A ROTATED pin adds three helper points on a small circle around it, rotated with the pin: MLS only knows points, so this is
+// what makes the picture turn around the pin instead of only sliding.
+constexpr float kPinSatRadius = 0.035f;
+inline bool buildPinPts(const Rig& R, const float* chv, std::vector<PinPt>& out) {
+    out.clear();
+    if (R.pins.empty()) return false;
+    bool moved = false;
+    for (size_t i = 0; i < R.pins.size(); i++) {
+        const glm::vec2 d(chv[(size_t) kPinBase + i * kPinChans], chv[(size_t) kPinBase + i * kPinChans + 1]);
+        const float rotDeg = chv[(size_t) kPinRotBase + i];
+        const float k = R.pins[i].stiff;
+        const glm::vec2 p = R.pins[i].rest, q = p + d;
+        if (std::fabs(d.x) > 1e-7f || std::fabs(d.y) > 1e-7f) moved = true;
+        out.push_back({p, q, k});
+        if (std::fabs(rotDeg) > 1e-4f) {
+            moved = true;
+            const float a = rotDeg * 0.017453292519943295f, c = std::cos(a), s = std::sin(a);
+            for (int j = 0; j < 3; j++) {
+                const float ang = 1.5707963f + 2.0943951f * (float) j;
+                const glm::vec2 u(std::cos(ang) * kPinSatRadius, std::sin(ang) * kPinSatRadius);
+                out.push_back({p + u, q + glm::vec2(c * u.x - s * u.y, s * u.x + c * u.y), k});
+            }
+        }
+    }
+    if (!moved) { out.clear(); return false; }
+    const glm::vec2 corners[4] = {{R.l, R.t}, {R.r, R.t}, {R.l, R.b}, {R.r, R.b}};
+    for (const glm::vec2& c : corners) out.push_back({c, c, 1.f});
+    return true;
+}
+
 // out = x y u v per vertex (paper units). x y = shown position, u v = rest position = texel to sample.
 inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, Pose& P) {
     computePose(R, chv, P);
@@ -579,6 +697,9 @@ inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, P
         c.on = R.curves[k].ctl.size() >= 2 && c.mix > 1e-4f && k < R.bind.size();
         if (c.on) posedCurve(R, P, chv, k, c.pts, c.thick);
     }
+
+    std::vector<PinPt> pinPts;
+    const bool warp = buildPinPts(R, chv, pinPts);
 
     for (size_t v = 0; v < V; v++) {
         const glm::vec2 p = R.rest[v];
@@ -602,6 +723,9 @@ inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, P
             const glm::vec2 q = C + T * B.w + N * (B.v * th);
             pos += (q - pos) * (B.mask * c.mix);
         }
+        if (warp) pos += mlsRigid(pinPts.data(), pinPts.size(), R.pinFalloff, p) - p;   // pins move the REST position; add the offset
+        // never hand the GPU a NaN / runaway vertex (it would smear the whole canvas): fall back to the rest position
+        if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || std::fabs(pos.x - p.x) > 8.f || std::fabs(pos.y - p.y) > 8.f) pos = p;
         out[v * 4] = pos.x; out[v * 4 + 1] = pos.y; out[v * 4 + 2] = p.x; out[v * 4 + 3] = p.y;
     }
     smoothDisplacement(R.grid, out);
@@ -610,7 +734,7 @@ inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, P
 // ------------------------------------------------------------------------------------------ UI helpers
 
 // Overlay data for the editor (stateless). [rest] = unposed geometry. Layout:
-//   [nB, nC]  nB * (headX headY tailX tailY)  per curve: nCtl, nCtl*(x y), nSamp, nSamp*(x y)   then kTotalChans channel values
+//   [nB, nC]  nB * (headX headY tailX tailY)  per curve: nCtl, nCtl*(x y), nSamp, nSamp*(x y)   nPins, nPins*(x y)   then kTotalChans channel values
 inline void evalOverlay(const Rig& R, const std::vector<float>& chv, bool rest, std::vector<float>& out) {
     Pose P;
     computePose(R, chv.data(), P);
@@ -648,6 +772,13 @@ inline void evalOverlay(const Rig& R, const std::vector<float>& chv, bool rest, 
         } else {
             out.push_back(0.f);
         }
+    }
+    // pins: count, then shown (or rest) positions
+    out.push_back((float) R.pins.size());
+    for (size_t i = 0; i < R.pins.size(); i++) {
+        glm::vec2 p = R.pins[i].rest;
+        if (!rest) p += glm::vec2(chv[(size_t) kPinBase + i * kPinChans], chv[(size_t) kPinBase + i * kPinChans + 1]);
+        out.push_back(p.x); out.push_back(p.y);
     }
     out.insert(out.end(), chv.begin(), chv.end());
 }

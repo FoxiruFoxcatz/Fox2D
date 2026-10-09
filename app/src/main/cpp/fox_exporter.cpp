@@ -35,6 +35,10 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 
+#include "fox_imagelayer.h"
+#include "fox_blend.h"
+
+
 #include "fox_audio_mix.h"
 #include "fox_anim.h"
 #include "fox_rig.h"
@@ -64,6 +68,8 @@ struct StrokeData {
     float size = 10.f;
     bool erase = false;
     std::vector<float> pts;
+    bool isImg = false;
+    
 };
 
 struct Job {
@@ -80,6 +86,11 @@ struct Job {
     std::vector<float> rigBlob;        // fox_rig.h set blob: [nRows, (len, floats) per row]; rows with a rig are drawn as a deformed mesh
     std::unordered_map<int, std::vector<size_t>> byCel;   // cel id -> indices into strokes (draw order)
     std::vector<uint8_t> layerVis;
+    std::vector<fox::blend::Fx> rowFx;     // per timeline row (bottom -> top): blend mode / opacity / clipping of the whole row
+    std::vector<fox::blend::Fx> layerFx;   // per entry of layerIds
+    std::vector<int> rowGroup;             // per timeline row: id of the group folder it sits in (-1 = none)
+    std::vector<std::pair<int, fox::blend::Fx>> groupFx;   // group id -> blend / opacity / clipping of the whole folder
+    bool fxUsed = false;                   // any row / layer has an effect: composite through intermediate pictures
     std::vector<StrokeData> strokes;
 
     std::atomic<int> done{0}, total{1};
@@ -329,6 +340,7 @@ struct Renderer {
     std::vector<float> posTmpE;
     GLint mTex = -1, mPivot = -1, mTr = -1, mSc = -1, mRot = -1, mAM = -1, mAT = -1;
     GLuint layerTex = 0, layerFbo = 0, outTex = 0, outFbo = 0;
+    fox::blend::Ctx fxc;   // intermediate pictures for blend modes + clipping masks
 
     // Rasterised (drawing, layer) textures. A moving row re-composites the same pixels every frame, so only
     // the first use of a (cel, layer) pair pays for the strokes. LRU, sized to ~96 MB (1 entry at huge sides).
@@ -339,6 +351,9 @@ struct Renderer {
 
     std::vector<Vert> batch;
     bool erase = false;
+    
+    GLuint imgProg = 0;
+    std::unordered_map<int, GLuint> imgTex;
 
     ~Renderer() { shutdown(); }
 
@@ -390,7 +405,9 @@ struct Renderer {
         quadProg = link(kQuadVS, kQuadFS);
         const std::string meshVS = std::string(kMeshVSHead) + kSmoothFn + kMeshVSMain;
         meshProg = link(meshVS.c_str(), kQuadFS);
-        if (!strokeProg || !quadProg || !meshProg) { err = "shader build failed"; return false; }
+        
+        imgProg = link(fox::img::kImageVS, fox::img::kImageFS);
+        if (!strokeProg || !quadProg || !meshProg || !imgProg) { err = "shader build failed"; return false; }
         mTex = glGetUniformLocation(meshProg, "uTex");
         mPivot = glGetUniformLocation(meshProg, "uPivot");
         mTr = glGetUniformLocation(meshProg, "uTr");
@@ -436,6 +453,9 @@ struct Renderer {
         cache.push_back(CachedLayer{-1, -1, layerTex, layerFbo, 0});
         cacheMax = (size_t) std::clamp<int64_t>((int64_t) 96 * 1024 * 1024 / ((int64_t) S * S * 4), 1, 16);
 
+        fxc.init(vaoEmpty);   // a failure only turns blend / clipping off (fxc.ok), the export itself still works
+        fxc.resize(S, S);
+
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
         glDisable(GL_DITHER);
@@ -450,6 +470,13 @@ struct Renderer {
                 if (e.tex) glDeleteTextures(1, &e.tex);
             }
             cache.clear();
+            
+            for (auto& kv : imgTex) glDeleteTextures(1, &kv.second);
+            imgTex.clear();
+            if (imgProg) glDeleteProgram(imgProg);
+            imgProg = 0;
+            
+            fxc.release();
             if (outFbo) glDeleteFramebuffers(1, &outFbo);
             if (outTex) glDeleteTextures(1, &outTex);
             if (vbo) glDeleteBuffers(1, &vbo);
@@ -508,8 +535,23 @@ struct Renderer {
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei) batch.size());
         batch.clear();
     }
+    
+    // image stroke: pts = [cx cy w h rot handle]
+    void drawImage(const StrokeData& s) {
+        if (s.pts.size() < 6) return;
+        const int h = (int) s.pts[5];
+        GLuint tex = 0;
+        auto it = imgTex.find(h);
+        if (it != imgTex.end()) tex = it->second;
+        else if (auto im = fox::img::get(h)) { tex = fox::img::makeTexture(*im); imgTex[h] = tex; }
+        if (!tex) return;
+        glBindFramebuffer(GL_FRAMEBUFFER, layerFbo);
+        glViewport(0, 0, S, S);
+        fox::img::draw(imgProg, tex, s.pts[0], s.pts[1], s.pts[2], s.pts[3], s.pts[4], vaoEmpty);
+    }
 
     void drawStroke(const StrokeData& s) {
+        if (s.isImg) { flush(); drawImage(s); return; }
         if (erase != s.erase) { flush(); erase = s.erase; }
         const size_t n = s.pts.size() / 2;
         if (n == 0) return;
@@ -536,102 +578,158 @@ struct Renderer {
     void renderFrame(const Job& j, const std::vector<int>& active, const std::vector<fox::anim::Xf>& xfs,
                      const std::vector<fox::rig::Rig>& rigs, const std::vector<std::vector<float>>& rverts,
                      const std::vector<fox::rig::Aff>& atts, std::vector<uint8_t>& rgba) {
+        const bool useFx = j.fxUsed && fxc.ok;
         glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
         glViewport(0, 0, S, S);
         const glm::vec4 bg = unpackArgb(j.bg);
         glClearColor(bg.r, bg.g, bg.b, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        for (size_t ri = 0; ri < active.size(); ri++) {
-            const int cel = active[ri];
-            if (cel < 0) continue;
-            const fox::rig::Aff am = ri < atts.size() ? atts[ri] : fox::rig::Aff{};
-            const float amv[4] = {am.a, am.b, am.c, am.d};
-            const fox::anim::Xf& xf = xfs[ri];   // this row's transform at this output frame (keyframes already applied)
-            auto it = j.byCel.find(cel);
-            if (it == j.byCel.end()) continue;
-            const std::vector<size_t>& idx = it->second;
-            const bool meshRow = ri < rigs.size() && rigs[ri].valid && ri < rverts.size() && !rverts[ri].empty();
+        // what each row draws this frame: its layers (visible + with strokes in the row's cel), bottom -> top
+        struct RowWork {
+            bool on = false;
+            int cel = -1;
+            fox::rig::Aff am;
+            const std::vector<size_t>* idx = nullptr;
+            bool meshRow = false;
             bool meshUploaded = false;
-
+            std::vector<size_t> items;   // indices into j.layerIds
+        };
+        std::vector<RowWork> work(active.size());
+        for (size_t ri = 0; ri < active.size(); ri++) {
+            RowWork& w = work[ri];
+            w.cel = active[ri];
+            if (w.cel < 0) continue;
+            auto it = j.byCel.find(w.cel);
+            if (it == j.byCel.end()) continue;
+            w.idx = &it->second;
+            w.am = ri < atts.size() ? atts[ri] : fox::rig::Aff{};
+            w.meshRow = ri < rigs.size() && rigs[ri].valid && ri < rverts.size() && !rverts[ri].empty();
             for (size_t li = 0; li < j.layerIds.size(); li++) {
                 if (!j.layerVis[li]) continue;
                 const int lid = j.layerIds[li];
                 bool any = false;
-                for (size_t si : idx) if (j.strokes[si].layer == lid) { any = true; break; }
-                if (!any) continue;
-
-                if (acquire(cel, lid)) {
-                    glBindFramebuffer(GL_FRAMEBUFFER, layerFbo);
-                    glViewport(0, 0, S, S);
-                    glClearColor(0.f, 0.f, 0.f, 0.f);
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    erase = false;
-                    for (size_t si : idx) if (j.strokes[si].layer == lid) drawStroke(j.strokes[si]);
-                    flush();
-                    erase = false;
-                }
-
-                glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
-                glViewport(0, 0, S, S);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, layerTex);
-                // flat quads sample 1:1 (nearest keeps them bit-exact); a deformed mesh needs smooth sampling
-                const GLint filter = meshRow ? GL_LINEAR : GL_NEAREST;
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-                if (meshRow) {
-                    glUseProgram(meshProg);
-                    glUniform1i(mTex, 0);
-                    glUniform2f(mPivot, xf.px, xf.py);
-                    glUniform2f(mTr, xf.tx, xf.ty);
-                    glUniform2f(mSc, xf.sx, xf.sy);
-                    glUniform1f(mRot, xf.rot * 3.14159265358979f / 180.f);
-                    glUniformMatrix2fv(mAM, 1, GL_FALSE, amv);
-                    glUniform2f(mAT, am.tx, am.ty);
-                    const int grid = rigs[ri].grid;
-                    const int sub = fox::rig::meshSub(grid);
-                    glActiveTexture(GL_TEXTURE1);
-                    if (!posTexE) {
-                        glGenTextures(1, &posTexE);
-                        glBindTexture(GL_TEXTURE_2D, posTexE);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);   // texelFetch: exact values
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                    }
-                    glBindTexture(GL_TEXTURE_2D, posTexE);
-                    if (!meshUploaded) {   // once per row and frame, shared by all its layers
-                        const int W = grid + 1;
-                        const size_t n = rverts[ri].size() / 4;
-                        posTmpE.resize(n * 2);
-                        for (size_t k = 0; k < n; k++) { posTmpE[k * 2] = rverts[ri][k * 4]; posTmpE[k * 2 + 1] = rverts[ri][k * 4 + 1]; }
-                        if (posTexW != W) { glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, W, W, 0, GL_RG, GL_FLOAT, posTmpE.data()); posTexW = W; }
-                        else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, W, GL_RG, GL_FLOAT, posTmpE.data());
-                        meshUploaded = true;
-                    }
-                    glActiveTexture(GL_TEXTURE0);
-                    glUniform1i(mPos, 1);
-                    glUniform1i(mGrid, grid);
-                    glUniform1i(mSub, sub);
-                    glUniform4f(mRect, rigs[ri].l, rigs[ri].t, rigs[ri].r, rigs[ri].b);
-                    glBindVertexArray(vaoEmpty);
-                    glDrawArrays(GL_TRIANGLES, 0, (GLsizei) (grid * grid * sub * sub * 6));
-                } else {
-                    glUseProgram(quadProg);
-                    glUniform1i(uTex, 0);
-                    glUniform2f(uPivot, xf.px, xf.py);
-                    glUniform2f(uTr, xf.tx, xf.ty);
-                    glUniform2f(uSc, xf.sx, xf.sy);
-                    glUniform1f(uRot, xf.rot * 3.14159265358979f / 180.f);
-                    glUniformMatrix2fv(uAM, 1, GL_FALSE, amv);
-                    glUniform2f(uAT, am.tx, am.ty);
-                    glBindVertexArray(vaoEmpty);
-                    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                }
+                for (size_t si : *w.idx) if (j.strokes[si].layer == lid) { any = true; break; }
+                if (any) w.items.push_back(li);
             }
+            w.on = !w.items.empty();
+        }
+
+        // One layer of one row into [fbo]: rasterise it once (cached), then place it with the row's transform.
+        auto drawItem = [&](size_t ri, size_t li, GLuint fbo, bool atop) {
+            RowWork& w = work[ri];
+            const int cel = w.cel;
+            const int lid = j.layerIds[li];
+            const float amv[4] = {w.am.a, w.am.b, w.am.c, w.am.d};
+            const fox::anim::Xf& xf = xfs[ri];   // this row's transform at this output frame (keyframes already applied)
+            if (acquire(cel, lid)) {
+                glBindFramebuffer(GL_FRAMEBUFFER, layerFbo);
+                glViewport(0, 0, S, S);
+                glClearColor(0.f, 0.f, 0.f, 0.f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                erase = false;
+                for (size_t si : *w.idx) if (j.strokes[si].layer == lid) drawStroke(j.strokes[si]);
+                flush();
+                erase = false;
+            }
+
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glViewport(0, 0, S, S);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, layerTex);
+            // flat quads sample 1:1 (nearest keeps them bit-exact); a deformed mesh needs smooth sampling
+            const GLint filter = w.meshRow ? GL_LINEAR : GL_NEAREST;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+            glEnable(GL_BLEND);
+            glBlendFunc(atop ? GL_DST_ALPHA : GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            if (w.meshRow) {
+                glUseProgram(meshProg);
+                glUniform1i(mTex, 0);
+                glUniform2f(mPivot, xf.px, xf.py);
+                glUniform2f(mTr, xf.tx, xf.ty);
+                glUniform2f(mSc, xf.sx, xf.sy);
+                glUniform1f(mRot, xf.rot * 3.14159265358979f / 180.f);
+                glUniformMatrix2fv(mAM, 1, GL_FALSE, amv);
+                glUniform2f(mAT, w.am.tx, w.am.ty);
+                const int grid = rigs[ri].grid;
+                const int sub = fox::rig::meshSub(grid);
+                glActiveTexture(GL_TEXTURE1);
+                if (!posTexE) {
+                    glGenTextures(1, &posTexE);
+                    glBindTexture(GL_TEXTURE_2D, posTexE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);   // texelFetch: exact values
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                }
+                glBindTexture(GL_TEXTURE_2D, posTexE);
+                if (!w.meshUploaded) {   // once per row and frame, shared by all its layers
+                    const int W = grid + 1;
+                    const size_t n = rverts[ri].size() / 4;
+                    posTmpE.resize(n * 2);
+                    for (size_t k = 0; k < n; k++) { posTmpE[k * 2] = rverts[ri][k * 4]; posTmpE[k * 2 + 1] = rverts[ri][k * 4 + 1]; }
+                    if (posTexW != W) { glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, W, W, 0, GL_RG, GL_FLOAT, posTmpE.data()); posTexW = W; }
+                    else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, W, GL_RG, GL_FLOAT, posTmpE.data());
+                    w.meshUploaded = true;
+                }
+                glActiveTexture(GL_TEXTURE0);
+                glUniform1i(mPos, 1);
+                glUniform1i(mGrid, grid);
+                glUniform1i(mSub, sub);
+                glUniform4f(mRect, rigs[ri].l, rigs[ri].t, rigs[ri].r, rigs[ri].b);
+                glBindVertexArray(vaoEmpty);
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei) (grid * grid * sub * sub * 6));
+            } else {
+                glUseProgram(quadProg);
+                glUniform1i(uTex, 0);
+                glUniform2f(uPivot, xf.px, xf.py);
+                glUniform2f(uTr, xf.tx, xf.ty);
+                glUniform2f(uSc, xf.sx, xf.sy);
+                glUniform1f(uRot, xf.rot * 3.14159265358979f / 180.f);
+                glUniformMatrix2fv(uAM, 1, GL_FALSE, amv);
+                glUniform2f(uAT, w.am.tx, w.am.ty);
+                glBindVertexArray(vaoEmpty);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+        };
+
+        // one timeline row = its layers composited bottom -> top (layer blend / opacity / clipping)
+        auto drawRow = [&](int ri, GLuint fbo, bool) {
+            const std::vector<size_t>& items = work[(size_t) ri].items;
+            fox::blend::stack(fxc, (int) items.size(), fbo, true,
+                [&](int) { return false; },
+                [&](int i) { return useFx && items[(size_t) i] < j.layerFx.size() ? j.layerFx[items[(size_t) i]] : fox::blend::Fx{}; },
+                [&](int i, GLuint f, bool atop) { drawItem((size_t) ri, items[(size_t) i], f, atop); });
+        };
+        auto groupOf = [&](int ri) { return (size_t) ri < j.rowGroup.size() ? j.rowGroup[(size_t) ri] : -1; };
+        auto groupFxOf = [&](int gid) -> fox::blend::Fx {
+            if (!useFx) return fox::blend::Fx{};
+            for (auto& p : j.groupFx) if (p.first == gid) return p.second;
+            return fox::blend::Fx{};
+        };
+        // rows of a group folder with an effect are composited as one picture (fox_blend.h stackRows)
+        auto drawRows = [&](GLuint dst) {
+            fox::blend::stackRows(fxc, (int) work.size(), dst,
+                [&](int ri) { return !work[(size_t) ri].on; },
+                [&](int ri) { return useFx && (size_t) ri < j.rowFx.size() ? j.rowFx[(size_t) ri] : fox::blend::Fx{}; },
+                groupOf, groupFxOf,
+                drawRow);
+        };
+
+        if (useFx) {
+            // blend modes need a backdrop: build the artwork on a transparent scene picture, then lay it over the background
+            fox::blend::Target* sc = fxc.acquire();
+            if (sc) {
+                drawRows(sc->fbo);
+                fox::blend::composite(fxc, sc->tex, outFbo, fox::blend::Fx{}, false);
+                fxc.giveBack();
+            } else {
+                glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
+                drawRows(outFbo);
+            }
+        } else {
+            drawRows(outFbo);
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
@@ -1031,6 +1129,36 @@ FN(jstring, nativeEncoders)(JNIEnv* env, jclass) {
     return env->NewStringUTF(out.c_str());
 }
 
+// Appends strokes to a job (also called repeatedly by nativeAddStrokes, so Java never has to build one array of every point).
+static bool appendStrokes(JNIEnv* env, Job& job, jintArray strokeMeta, jfloatArray strokeSize, jfloatArray strokePts) {
+    const std::vector<int> meta = ints(env, strokeMeta);
+    const jsize nStrokes = (jsize) (meta.size() / 5);
+    if (strokeSize && env->GetArrayLength(strokeSize) < nStrokes) return false;
+    std::vector<float> sizes((size_t) nStrokes);
+    if (nStrokes) env->GetFloatArrayRegion(strokeSize, 0, nStrokes, sizes.data());
+    const jsize ptsLen = strokePts ? env->GetArrayLength(strokePts) : 0;
+    std::vector<float> pts((size_t) ptsLen);
+    if (ptsLen) env->GetFloatArrayRegion(strokePts, 0, ptsLen, pts.data());
+
+    size_t off = 0;
+    job.strokes.reserve(job.strokes.size() + (size_t) nStrokes);
+    for (jsize i = 0; i < nStrokes; i++) {
+        StrokeData s;
+        s.cel = meta[(size_t) i * 5];
+        s.layer = meta[(size_t) i * 5 + 1];
+        s.argb = (uint32_t) meta[(size_t) i * 5 + 2];
+        s.erase = meta[(size_t) i * 5 + 3] == 1;
+        s.isImg = meta[(size_t) i * 5 + 3] == 2;
+        const size_t cnt = (size_t) std::max(0, meta[(size_t) i * 5 + 4]) * 2;
+        if (off + cnt > pts.size()) return false;
+        s.size = sizes[(size_t) i];
+        s.pts.assign(pts.begin() + (ptrdiff_t) off, pts.begin() + (ptrdiff_t) (off + cnt));
+        off += cnt;
+        job.strokes.push_back(std::move(s));
+    }
+    return true;
+}
+
 FN(jlong, nativeCreate)(JNIEnv* env, jclass, jstring path, jint side, jint fps, jint srcFps, jint bg,
                         jstring codec, jfloat crf, jint videoKbps, jstring preset, jint audioKbps, jstring extra,
                         jintArray celIds, jintArray celLens, jintArray celRows, jintArray rowStarts, jfloatArray rowXf, jintArray rowKeyCounts, jfloatArray rowKeys, jfloatArray rigBlob, jintArray rowAttach, jintArray layerIds, jbooleanArray layerVis,
@@ -1080,35 +1208,92 @@ FN(jlong, nativeCreate)(JNIEnv* env, jclass, jstring path, jint side, jint fps, 
     }
     if (job->layerVis.size() != job->layerIds.size()) return 0;
 
-    const std::vector<int> meta = ints(env, strokeMeta);
-    const jsize nStrokes = (jsize) (meta.size() / 5);
-    if (strokeSize && env->GetArrayLength(strokeSize) < nStrokes) return 0;
-    std::vector<float> sizes((size_t) nStrokes);
-    if (nStrokes) env->GetFloatArrayRegion(strokeSize, 0, nStrokes, sizes.data());
-    const jsize ptsLen = strokePts ? env->GetArrayLength(strokePts) : 0;
-    std::vector<float> pts((size_t) ptsLen);
-    if (ptsLen) env->GetFloatArrayRegion(strokePts, 0, ptsLen, pts.data());
-
-    size_t off = 0;
-    job->strokes.reserve((size_t) nStrokes);
-    for (jsize i = 0; i < nStrokes; i++) {
-        StrokeData s;
-        s.cel = meta[(size_t) i * 5];
-        s.layer = meta[(size_t) i * 5 + 1];
-        s.argb = (uint32_t) meta[(size_t) i * 5 + 2];
-        s.erase = meta[(size_t) i * 5 + 3] != 0;
-        const size_t cnt = (size_t) std::max(0, meta[(size_t) i * 5 + 4]) * 2;
-        if (off + cnt > pts.size()) return 0;
-        s.size = sizes[(size_t) i];
-        s.pts.assign(pts.begin() + (ptrdiff_t) off, pts.begin() + (ptrdiff_t) (off + cnt));
-        off += cnt;
-        job->strokes.push_back(std::move(s));
-    }
+    if (!appendStrokes(env, *job, strokeMeta, strokeSize, strokePts)) return 0;
 
     std::lock_guard<std::mutex> l(gMu);
     const jlong h = gNext++;
     gJobs[h] = std::move(job);
     return h;
+}
+
+// More strokes for a job created by nativeCreate (call before nativeRun, any number of times, small batches).
+FN(jboolean, nativeAddStrokes)(JNIEnv* env, jclass, jlong h, jintArray strokeMeta, jfloatArray strokeSize, jfloatArray strokePts) {
+    auto j = findJob(h);
+    if (!j) return JNI_FALSE;
+    return appendStrokes(env, *j, strokeMeta, strokeSize, strokePts) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Blend / opacity / clipping of the rows (bottom -> top) and layers (by layer id). Call after nativeCreate, before nativeRun.
+FN(void, nativeSetFx)(JNIEnv* env, jclass, jlong h, jintArray rMode, jfloatArray rOpacity, jbooleanArray rClip,
+                      jintArray lIds, jintArray lMode, jfloatArray lOpacity, jbooleanArray lClip) {
+    auto j = findJob(h);
+    if (!j) return;
+    j->rowFx.clear();
+    j->layerFx.assign(j->layerIds.size(), fox::blend::Fx{});
+    j->fxUsed = false;
+    const jsize nR = rMode ? env->GetArrayLength(rMode) : 0;
+    if (nR > 0 && rOpacity && rClip && env->GetArrayLength(rOpacity) >= nR && env->GetArrayLength(rClip) >= nR) {
+        std::vector<jint> m((size_t) nR);
+        std::vector<jfloat> o((size_t) nR);
+        std::vector<jboolean> c((size_t) nR);
+        env->GetIntArrayRegion(rMode, 0, nR, m.data());
+        env->GetFloatArrayRegion(rOpacity, 0, nR, o.data());
+        env->GetBooleanArrayRegion(rClip, 0, nR, c.data());
+        for (jsize i = 0; i < nR; i++) {
+            fox::blend::Fx f = fox::blend::makeFx(m[(size_t) i], o[(size_t) i], c[(size_t) i] != 0);
+            if (!f.none()) j->fxUsed = true;
+            j->rowFx.push_back(f);
+        }
+    }
+    const jsize nL = lIds ? env->GetArrayLength(lIds) : 0;
+    if (nL > 0 && lMode && lOpacity && lClip && env->GetArrayLength(lMode) >= nL && env->GetArrayLength(lOpacity) >= nL && env->GetArrayLength(lClip) >= nL) {
+        std::vector<jint> ids((size_t) nL), m((size_t) nL);
+        std::vector<jfloat> o((size_t) nL);
+        std::vector<jboolean> c((size_t) nL);
+        env->GetIntArrayRegion(lIds, 0, nL, ids.data());
+        env->GetIntArrayRegion(lMode, 0, nL, m.data());
+        env->GetFloatArrayRegion(lOpacity, 0, nL, o.data());
+        env->GetBooleanArrayRegion(lClip, 0, nL, c.data());
+        for (jsize i = 0; i < nL; i++) {
+            for (size_t li = 0; li < j->layerIds.size(); li++) {
+                if (j->layerIds[li] != ids[(size_t) i]) continue;
+                fox::blend::Fx f = fox::blend::makeFx(m[(size_t) i], o[(size_t) i], c[(size_t) i] != 0);
+                if (!f.none()) j->fxUsed = true;
+                j->layerFx[li] = f;
+            }
+        }
+    }
+    for (auto& p : j->groupFx) if (!p.second.none()) j->fxUsed = true;   // group effects set before this call
+}
+
+// Blend / opacity / clipping of group folders. rowGroup = group id of every timeline row (bottom -> top, -1 = none).
+// Call after nativeCreate, before nativeRun (any order relative to nativeSetFx).
+FN(void, nativeSetGroupFx)(JNIEnv* env, jclass, jlong h, jintArray rowGroup, jintArray gIds, jintArray gMode,
+                           jfloatArray gOpacity, jbooleanArray gClip) {
+    auto j = findJob(h);
+    if (!j) return;
+    j->rowGroup.clear();
+    j->groupFx.clear();
+    const jsize nR = rowGroup ? env->GetArrayLength(rowGroup) : 0;
+    if (nR > 0) {
+        j->rowGroup.resize((size_t) nR);
+        env->GetIntArrayRegion(rowGroup, 0, nR, j->rowGroup.data());
+    }
+    const jsize nG = gIds ? env->GetArrayLength(gIds) : 0;
+    if (nG > 0 && gMode && gOpacity && gClip && env->GetArrayLength(gMode) >= nG && env->GetArrayLength(gOpacity) >= nG && env->GetArrayLength(gClip) >= nG) {
+        std::vector<jint> ids((size_t) nG), m((size_t) nG);
+        std::vector<jfloat> o((size_t) nG);
+        std::vector<jboolean> c((size_t) nG);
+        env->GetIntArrayRegion(gIds, 0, nG, ids.data());
+        env->GetIntArrayRegion(gMode, 0, nG, m.data());
+        env->GetFloatArrayRegion(gOpacity, 0, nG, o.data());
+        env->GetBooleanArrayRegion(gClip, 0, nG, c.data());
+        for (jsize i = 0; i < nG; i++) {
+            fox::blend::Fx f = fox::blend::makeFx(m[(size_t) i], o[(size_t) i], c[(size_t) i] != 0);
+            if (!f.none()) j->fxUsed = true;
+            j->groupFx.emplace_back(ids[(size_t) i], f);
+        }
+    }
 }
 
 FN(jint, nativeRun)(JNIEnv*, jclass, jlong h) {

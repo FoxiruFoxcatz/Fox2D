@@ -29,6 +29,12 @@ if(NOT EXISTS "${GLM_ROOT}/glm/glm.hpp")
 endif()
 message(STATUS "[glm] header-only include root: ${GLM_ROOT}")
 
+set(CQ_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/ExternalLibraries/concurrent_queue")
+if(NOT EXISTS "${CQ_ROOT}/moodycamel/concurrentqueue.h" OR NOT EXISTS "${CQ_ROOT}/moodycamel/blockingconcurrentqueue.h")
+    message(FATAL_ERROR "moodycamel headers not found: ${CQ_ROOT}/moodycamel/{concurrentqueue,blockingconcurrentqueue,lightweightsemaphore}.h (folder must contain moodycamel/ directly)")
+endif()
+message(STATUS "[concurrent_queue] header-only include root: ${CQ_ROOT}")
+
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/lib_config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/generated/lib_config.h
@@ -40,6 +46,8 @@ add_library(${LIB_NAME} SHARED
     fox_canvas.cpp
     fox_audio.cpp
     fox_exporter.cpp
+    fox_loopgen.cpp
+    fox_project.cpp
 )
 
 target_include_directories(${LIB_NAME} PRIVATE
@@ -52,12 +60,13 @@ target_link_libraries(${LIB_NAME} PRIVATE
     GLESv3
     EGL
     android
-    m 
+    m
+    z
 )
 
 fox_ext_link(${LIB_NAME} ffmpeg SHARED)
 fox_ext_link(${LIB_NAME} oboe SHARED)
-target_include_directories(${LIB_NAME} SYSTEM PRIVATE "${EIGEN_ROOT}" "${GLM_ROOT}")
+target_include_directories(${LIB_NAME} SYSTEM PRIVATE "${EIGEN_ROOT}" "${GLM_ROOT}" "${CQ_ROOT}")
 target_compile_definitions(${LIB_NAME} PRIVATE
     FOX_HAS_EIGEN=1
     FOX_HAS_GLM=1

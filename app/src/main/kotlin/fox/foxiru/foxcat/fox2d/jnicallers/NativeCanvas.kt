@@ -48,16 +48,33 @@ object NativeCanvas {
     @JvmStatic external fun nativeEvalXf(keys: FloatArray, n: Int, local: Float, base: FloatArray): FloatArray
     @JvmStatic external fun nativeEaseCurve(id: Int, x1: Float, y1: Float, x2: Float, y2: Float, n: Int): FloatArray
     @JvmStatic external fun nativeSetLayers(ids: IntArray, visible: BooleanArray)
+    @JvmStatic external fun nativeSetFx(lMode: IntArray, lOpacity: FloatArray, lClip: BooleanArray, rMode: IntArray, rOpacity: FloatArray, rClip: BooleanArray)
+    @JvmStatic external fun nativeSetGroupFx(rowGroup: IntArray, gIds: IntArray, gMode: IntArray, gOpacity: FloatArray, gClip: BooleanArray)
     @JvmStatic external fun nativeAddStroke(cel: Int, layer: Int, argb: Int, size: Float, erase: Boolean, xy: FloatArray)
+    @JvmStatic external fun nativeAddStrokesFromBlob(blob: Long, celRow: IntArray, layerTab: IntArray, slots: Int, imgHandles: IntArray): Boolean
 
     // rigging + deformation (maths lives in fox_rig.h)
     @JvmStatic external fun nativeSetRig(blob: FloatArray)
     @JvmStatic external fun nativeSetRigPosed(on: Boolean)
     @JvmStatic external fun nativeEvalRig(row: FloatArray, local: Float, rest: Boolean): FloatArray
     @JvmStatic external fun nativeRigWeights(row: FloatArray, bone: Int): FloatArray
+    @JvmStatic external fun nativeSetMeshLines(on: Boolean, row: Int)
+    @JvmStatic external fun nativeGenMesh(mask: ByteArray, n: Int, spacing: Float, dilatePx: Int): FloatArray
+    @JvmStatic external fun nativeSetTriMesh(row: Int, verts: FloatArray, tris: FloatArray)
+    @JvmStatic external fun nativeClearTriMeshes()
+    @JvmStatic external fun nativeFitPins(src: ByteArray, tgt: ByteArray, n: Int, mode: Int, uniform: Boolean, maxPins: Int): FloatArray
     @JvmStatic external fun nativeUnwarp(row: Int, x: Float, y: Float): FloatArray
     @JvmStatic external fun nativeSetAttach(a: IntArray)
     @JvmStatic external fun nativeAttach(row: Int): FloatArray
+    
+    // images (pixels live in fox_images.h, shared with the exporter)
+    @JvmStatic external fun nativeImageLoad(w: Int, h: Int, px: java.nio.ByteBuffer): Int
+    @JvmStatic external fun nativeImageRelease(handle: Int)
+    @JvmStatic external fun nativeAddImage(cel: Int, layer: Int, handle: Int, cx: Float, cy: Float, w: Float, h: Float, rot: Float)
+
+    fun addImage(cel: Int, layer: Int, handle: Int, cx: Float, cy: Float, w: Float, h: Float, rot: Float) {
+        nativeAddImage(cel, layer, handle, cx, cy, w, h, rot); requestRender()
+    }
 
     @Volatile
     private var view: GLSurfaceView? = null
@@ -113,6 +130,27 @@ object NativeCanvas {
         nativeSetLayers(ids, visible); requestRender()
     }
 
+    /**
+     * Blend mode / opacity / clipping (fox_blend.h). Layer arrays are indexed by native layer id (same order as [setLayers]),
+     * row arrays by timeline row (bottom -> top). Modes: see EditorScreen.kt BlendMode.
+     */
+    fun setFx(lMode: IntArray, lOpacity: FloatArray, lClip: BooleanArray, rMode: IntArray, rOpacity: FloatArray, rClip: BooleanArray) {
+        nativeSetFx(lMode, lOpacity, lClip, rMode, rOpacity, rClip); requestRender()
+    }
+
+    /** Blend / opacity / clipping of group folders: [rowGroup] = group id of every timeline row (bottom -> top, -1 = none). */
+    fun setGroupFx(rowGroup: IntArray, gIds: IntArray, gMode: IntArray, gOpacity: FloatArray, gClip: BooleanArray) {
+        nativeSetGroupFx(rowGroup, gIds, gMode, gOpacity, gClip); requestRender()
+    }
+
+    /**
+     * Project load: queue every stroke of a parsed strokes.bin ([fox.foxiru.foxcat.fox2d.jnicallers.NativeProject] handle) straight
+     * from native memory. [celRow] = pairs (cel id, timeline row), [layerTab] = rows * [slots] layer ids (Int.MIN_VALUE = empty),
+     * [imgHandles] = native image handle per blob image file. false = bad handle: the caller replays the Kotlin strokes instead.
+     */
+    fun addStrokesFromBlob(blob: Long, celRow: IntArray, layerTab: IntArray, slots: Int, imgHandles: IntArray): Boolean =
+        nativeAddStrokesFromBlob(blob, celRow, layerTab, slots, imgHandles).also { requestRender() }
+
     fun addStroke(cel: Int, layer: Int, argb: Int, size: Float, erase: Boolean, xy: FloatArray) {
         nativeAddStroke(cel, layer, argb, size, erase, xy); requestRender()
     }
@@ -122,6 +160,26 @@ object NativeCanvas {
 
     /** false = rigged rows are drawn flat (rest pose) so bones / curves can be built on the untouched picture. */
     fun setRigPosed(on: Boolean) { nativeSetRigPosed(on); requestRender() }
+
+    /** Show the rig mesh as GPU lines (drawn by the canvas shader, no Compose drawing). [row] = timeline row, -1 = every rigged row. */
+    fun setMeshLines(on: Boolean, row: Int = -1) { nativeSetMeshLines(on, row); requestRender() }
+
+    /**
+     * Outline-following triangle mesh (fox_mesh.h) from a drawing mask (n * n bytes, > 127 = inside). Stateless.
+     * Result: [nV, nT, x, y * nV, i, j, k * nT]; empty = no shape.
+     */
+    fun genMesh(mask: ByteArray, n: Int, spacing: Float, dilatePx: Int): FloatArray = nativeGenMesh(mask, n, spacing, dilatePx)
+
+    /** Show a triangle mesh on timeline row [row] (as lines, replaces that row's square grid). */
+    fun setTriMesh(row: Int, verts: FloatArray, tris: FloatArray) { nativeSetTriMesh(row, verts, tris); requestRender() }
+    fun clearTriMeshes() { nativeClearTriMeshes(); requestRender() }
+
+    /**
+     * Puppet-warp pins that fit a drawing silhouette to a picture silhouette (fox_fit.h). Both masks n * n bytes. Stateless.
+     * Result: [l, t, r, b of the mapped picture, pin count, then rx, ry, dx, dy per pin]; empty = nothing found.
+     */
+    fun fitPins(src: ByteArray, tgt: ByteArray, n: Int, mode: Int, uniform: Boolean, maxPins: Int): FloatArray =
+        nativeFitPins(src, tgt, n, mode, uniform, maxPins)
 
     /** Overlay geometry + every channel value of ONE row's rig at row-local [local]. Stateless. Empty = no rig. */
     fun evalRig(row: FloatArray, local: Float, rest: Boolean): FloatArray = nativeEvalRig(row, local, rest)

@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -64,6 +65,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -73,6 +75,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -113,6 +116,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import fox.foxiru.foxcat.fox2d.jnicallers.AudioHandlerNative
 import fox.foxiru.foxcat.fox2d.jnicallers.NativeCanvas
+import fox.foxiru.foxcat.fox2d.jnicallers.NativeProject
 import fox.foxiru.foxcat.fox2d.jnicallers.NativeCanvasSurface
 import fox.foxiru.foxcat.fox2d.timeline.AudioClip
 import fox.foxiru.foxcat.fox2d.timeline.AudioTrack
@@ -126,7 +130,12 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.roundToInt
 
-enum class Tool { Brush, Deform, Bone }
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
+
+enum class Tool { Brush, Deform, Bone, Warp }
 enum class Panel { None, Color, Layers, Brush }
 
 /** Editor chrome floats over the full-screen canvas; this is how opaque it is. */
@@ -141,7 +150,18 @@ enum class BrushKind(val label: String, val ico: Ico, val ready: Boolean) {
 }
 
 /** One drawing (exposure) on timeline row [track]. Held on screen for [len] timeline frames. */
-data class Cel(val id: Int, val len: Int = 4, val track: Int = 0)
+data class Cel(
+    val id: Int, val len: Int = 4, val track: Int = 0,
+    /**
+     * LEGACY, always -1 now. Loop / Freeze used to GENERATE copies of drawings (gen = source drawing id, -2 = blank hold);
+     * a group's Re-timing ([TrackGroup.fill]) is now a time mapping ([retimeFrame]) and creates no cels at all. The field is
+     * kept so code that still reads it (project IO, ...) keeps compiling.
+     */
+    val gen: Int = -1,
+)
+
+/** The drawing whose strokes this cel shows (a real drawing always shows itself). */
+fun Cel.shownId(): Int = if (gen >= 0) gen else id
 
 /** One drawing row of the timeline (its own run of cels). Rows are stored bottom -> top. */
 /**
@@ -219,29 +239,187 @@ data class DrawTrack(
      * so a stroke's layer id alone says which row it belongs to; duplicating a row gives the copy fresh ids.
      */
     val layers: List<Layer> = emptyList(),
+    /** Id of the [TrackGroup] this row sits in, -1 = top level. Drawing members of one group are always adjacent in the stack. */
+    val group: Int = -1,
+    /** Whole-row blend mode (index into [FxBlend.names]), opacity and clipping mask (visible only where the row below has pixels). */
+    val blend: Int = 0,
+    val opacity: Float = 1f,
+    val clip: Boolean = false,
 ) {
-    /** Flat key array for native; built once per immutable copy. */
-    val packedKeys: FloatArray by lazy(LazyThreadSafetyMode.NONE) { keys.pack() }
+    // PERF: derived key data is shared by every copy() that keeps the SAME key lists. Dragging a row / group changes only
+    // [offset], and a `by lazy` would be rebuilt (pack + sort + distinct over every key) for every pointer move.
+    private val derived: KeyDerived get() = KeyDerivedCache.get(keys, rig.keys)
+
+    /** Flat key array for native. */
+    val packedKeys: FloatArray get() = derived.packed
     /** Every frame that carries a key on ANY property (the marks on the timeline). */
     val keyFrames: List<Int> by lazy(LazyThreadSafetyMode.NONE) { keys.map { it.frame }.distinct().sorted() }
     /** Transform keys + rig keys. Channel numbers of the two kinds overlap, so use this for frames / easing only. */
-    val allKeys: List<ChanKey> by lazy(LazyThreadSafetyMode.NONE) { if (rig.keys.isEmpty()) keys else keys + rig.keys }
-    /** Every frame that carries a key of ANY kind (timeline marks, ruler, prev / next key). */
-    val markFrames: List<Int> by lazy(LazyThreadSafetyMode.NONE) { allKeys.map { it.frame }.distinct().sorted() }
+    val allKeys: List<ChanKey> get() = derived.all
+    /** Every frame that carries a key of ANY kind (timeline marks, ruler, prev / next key). Sorted. */
+    val markFrames: List<Int> get() = derived.marks
+    /** Parallel to [markFrames]: true when every key on that frame is Hold (the mark is drawn square). */
+    val markHold: BooleanArray get() = derived.markHold
     fun lane(c: Chan): List<ChanKey> = keys.filter { it.chan == c.id }
     fun baseArray(): FloatArray = FloatArray(7).also { xf.writeTo(it, 0) }
 }
 
+/** Everything derived from a row's two key lists (see [DrawTrack.derived]). */
+class KeyDerived(val packed: FloatArray, val all: List<ChanKey>, val marks: List<Int>, val markHold: BooleanArray)
+
+/** Identity cache: the same (keys, rig keys) list objects always give the same [KeyDerived]. Bounded; a miss only costs a rebuild. */
+private object KeyDerivedCache {
+    private class E(val keys: List<ChanKey>, val rig: List<ChanKey>, val d: KeyDerived)
+    private val map = object : LinkedHashMap<Int, E>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, E>) = size > 1024
+    }
+
+    @Synchronized
+    fun get(keys: List<ChanKey>, rig: List<ChanKey>): KeyDerived {
+        val h = 31 * System.identityHashCode(keys) + System.identityHashCode(rig)
+        val e = map[h]
+        if (e != null && e.keys === keys && e.rig === rig) return e.d
+        val all = if (rig.isEmpty()) keys else keys + rig
+        val frames = java.util.TreeMap<Int, Boolean>()          // frame -> every key there is Hold
+        for (k in all) frames[k.frame] = (frames[k.frame] ?: true) && k.ease.isHold
+        val marks = ArrayList<Int>(frames.keys)
+        val hold = BooleanArray(marks.size) { frames[marks[it]] == true }
+        val d = KeyDerived(keys.pack(), all, marks, hold)
+        map[h] = E(keys, rig, d)
+        return d
+    }
+}
+
 data class InkStroke(
-    val cel: Int,
-    val layer: Int,
-    val color: Color,
-    val size: Float,
-    val pts: List<Offset>,
+    val cel: Int, val layer: Int, val color: Color, val size: Float, val pts: List<Offset>,
     val erase: Boolean = false,
+    val image: ImagePlace? = null,        // non-null = imported picture (pts empty)
 )
 
-data class Layer(val id: Int, val name: String, val visible: Boolean = true)
+/** blend: index into [FxBlend.names]; opacity 0..1; clip = only visible where the layer / row below it has pixels. */
+data class Layer(val id: Int, val name: String, val visible: Boolean = true, val blend: Int = 0, val opacity: Float = 1f, val clip: Boolean = false)
+
+/** Order matches fox_blend.h Mode. */
+object FxBlend {
+    val names = listOf(
+        "Normal", "Multiply", "Screen", "Overlay", "Darken", "Lighten", "Add", "Color Dodge", "Color Burn",
+        "Soft Light", "Hard Light", "Difference", "Exclusion",
+    )
+    fun name(i: Int): String = names.getOrElse(i) { names[0] }
+}
+
+/** What the Blend dialog edits: a whole drawing row, one drawing layer (Body / Head ...) of a row, or a whole group folder. */
+sealed interface FxTarget {
+    data class Row(val id: Int) : FxTarget
+    data class Lay(val id: Int) : FxTarget
+    data class Grp(val id: Int) : FxTarget
+}
+
+/**
+ * A folder of tracks (like a group layer in Alight Motion). Drawing rows and audio layers join it through their
+ * own `group` field. A group has no transform of its own, so the canvas and the export are not touched by it:
+ * it only organises the timeline (open / close, rename, lock, move all members in time, reorder as one block).
+ */
+data class TrackGroup(
+    val id: Int,
+    val name: String,
+    /**
+     * End of the group bar, in timeline frames (-1 = not stretched). Drag the right edge of the selected bar to set it;
+     * the Re-timing mode decides what the time between the members' content and this end shows.
+     */
+    val endFrame: Int = -1,
+    /**
+     * Re-timing mode ([FILL_NONE] = Off, [FILL_FREEZE], [FILL_STRETCH], [FILL_LOOP], [FILL_LOOP_STRETCH], [FILL_BLANK]).
+     * (Named `fill` because that is what project files already store; the values 0..2 keep their old meaning.)
+     * It is only a MAPPING from timeline time to source time, see [retimeFrame]: it never creates drawings.
+     */
+    val fill: Int = 0,
+    /** Blend mode (index into [FxBlend.names]), opacity and clipping of the whole folder: its DRAWING rows are composited as one picture (audio members draw nothing). */
+    val blend: Int = 0,
+    val opacity: Float = 1f,
+    val clip: Boolean = false,
+)
+
+// Re-timing modes. 0..2 are the values older projects already store.
+const val FILL_NONE = 0          // Off: content plays once, nothing is re-timed
+const val FILL_LOOP = 1          // repeat the content up to the bar end
+const val FILL_FREEZE = 2        // hold every row's last drawing up to the bar end
+const val FILL_STRETCH = 3       // scale the content's speed so it fills the bar
+const val FILL_LOOP_STRETCH = 4  // loop a whole number of times, each repeat stretched a little so the last one ends exactly on the bar end
+const val FILL_BLANK = 5         // content plays once, then nothing up to the bar end
+
+/** Order and names of the Re-timing dropdown (same as Alight Motion). */
+val RETIME_MODES = intArrayOf(FILL_NONE, FILL_FREEZE, FILL_STRETCH, FILL_LOOP, FILL_LOOP_STRETCH, FILL_BLANK)
+
+fun retimeName(mode: Int): String = when (mode) {
+    FILL_FREEZE -> "Freeze"
+    FILL_STRETCH -> "Stretch"
+    FILL_LOOP -> "Loop"
+    FILL_LOOP_STRETCH -> "Loop & Stretch"
+    FILL_BLANK -> "Blank"
+    else -> "Off"
+}
+
+/** [retimeFrame] result when nothing is shown. */
+const val RETIME_BLANK = -1
+
+/**
+ * Re-timing as pure arithmetic: which frame of the group's SOURCE [a, b) is shown at timeline frame [f], for a group
+ * whose bar runs a..[end]. O(1), nothing is generated, so a loop an hour long costs exactly what one repeat costs.
+ * Returns [RETIME_BLANK] when nothing is shown. Frames before [a] and mode Off return [f] unchanged.
+ */
+fun retimeFrame(mode: Int, a: Int, b: Int, end: Int, f: Int): Int {
+    if (mode == FILL_NONE || f < a) return f
+    val p = (b - a).toLong()
+    if (p <= 0L) return f
+    val e = maxOf(end, b)
+    if (f >= e) return RETIME_BLANK
+    val l = (e - a).toLong()          // bar length
+    val x = (f - a).toLong()          // time into the bar
+    return when (mode) {
+        FILL_BLANK -> if (f < b) f else RETIME_BLANK
+        FILL_FREEZE -> if (f < b) f else b - 1
+        FILL_STRETCH -> a + (x * p / l).toInt()
+        FILL_LOOP -> a + (x % p).toInt()
+        FILL_LOOP_STRETCH -> {
+            val n = maxOf(1L, (l + p / 2) / p)               // whole repeats that fit the bar
+            a + ((x * n % l) * p / l).toInt()                // position inside the repeat, scaled back to source length
+        }
+        else -> f
+    }
+}
+
+/** Upper bound for audio repeat copies of one group (sound is the only thing a Loop still copies). */
+private const val MAX_LOOP_CLIPS = 4096
+
+/** One row's unrolled Loop above this many keys is not baked for native (see EditorState.liveRows): it falls back to the offset shift. */
+private const val BAKE_MAX_KEYS = 4096
+
+/** What the rename dialog is editing. */
+sealed interface RenameTarget {
+    data class Draw(val id: Int) : RenameTarget
+    data class Audio(val id: Int) : RenameTarget
+    data class Group(val id: Int) : RenameTarget
+}
+
+/** Key a whole group gets while the timeline reorders top-level items (track ids are >= 0, -1 means "none"). */
+internal fun groupKey(group: Int): Int = -2 - group
+
+/** Start times of a group's unlocked members, taken when a drag begins (see EditorState.shiftGroup). */
+class GroupShift(val draw: Map<Int, Int>, val clips: Map<Int, Long>)
+
+/**
+ * One pass + two snapshot writes. SnapshotStateList.removeAll { } compacts in place: every element behind the first hit is
+ * moved with its own state write, which is what made a big loop crawl while its end was dragged.
+ */
+private inline fun <T> SnapshotStateList<T>.removeWhere(pred: (T) -> Boolean): Boolean {
+    var any = false
+    val kept = ArrayList<T>(size)
+    for (x in this) if (pred(x)) any = true else kept.add(x)
+    if (!any) return false
+    Snapshot.withMutableSnapshot { clear(); addAll(kept) }
+    return true
+}
 
 /** Immutable copy of everything the timeline edits touch: audio clips/tracks and the drawing (cel) sequence. */
 data class EditSnap(
@@ -251,10 +429,12 @@ data class EditSnap(
     val drawTracks: List<DrawTrack>,
     val strokes: List<InkStroke>,
     val selected: Int,
+    val groups: List<TrackGroup> = emptyList(),
 ) {
     /** Selection alone is not an edit. */
     fun sameAs(o: EditSnap) =
-        clips == o.clips && tracks == o.tracks && cels == o.cels && drawTracks == o.drawTracks && strokes == o.strokes
+        clips == o.clips && tracks == o.tracks && cels == o.cels && drawTracks == o.drawTracks && strokes == o.strokes &&
+            groups == o.groups
 }
 
 /** App-wide clipboard. Audio shares the decoded PCM handle (no copy); drawings carry their strokes. */
@@ -310,6 +490,9 @@ class EditorState {
     var propsOpen by mutableStateOf(false)
     var exportOpen by mutableStateOf(false)
 
+    /** Id of the project this state currently holds (set by applyProject); null = none opened yet. */
+    var projectId by mutableStateOf<String?>(null)
+
     var playing by mutableStateOf(false)
     var frame by mutableIntStateOf(0)
     var fps by mutableIntStateOf(12)
@@ -319,7 +502,66 @@ class EditorState {
     val drawTracks = mutableStateListOf(DrawTrack(0, "Drawing 1", layers = listOf(Layer(0, "Body"), Layer(1, "Head"), Layer(2, "Tail"))))
     var activeTrack by mutableIntStateOf(0)
     val cels = mutableStateListOf(Cel(0, 4), Cel(1, 4), Cel(2, 4))
-    val frameCount: Int get() = maxOf(1, drawTracks.maxOfOrNull { trackLen(it.id) } ?: 1)
+
+    // PERF: lookups the timeline hits every frame. They are rebuilt ONCE per edit (derivedStateOf), not once per call,
+    // so a looped group with thousands of generated cels / strokes costs O(1) per lookup instead of O(all cels).
+    /** Cels of every row, in row order. */
+    val celsByTrack: Map<Int, List<Cel>> by derivedStateOf { cels.groupBy { it.track } }
+    /** Strokes of every drawing (cel id). */
+    val strokesByCel: Map<Int, List<InkStroke>> by derivedStateOf { strokes.groupBy { it.cel } }
+    /** Cheap change signature of each drawing's strokes: lets the timeline thumbnails know when to repaint. */
+    val celStrokeSig: Map<Int, Int> by derivedStateOf {
+        val m = HashMap<Int, Int>()
+        for (s in strokes) m[s.cel] = 31 * (m[s.cel] ?: 17) + System.identityHashCode(s)
+        m
+    }
+
+    /**
+     * PERF: prefix sums of every row's cel lengths (rel[i] = row-local start frame of cel i, rel[size] = row length), built
+     * ONCE per edit. A Loop / Freeze group holds thousands of generated cels; before this, celIndexAt / celStart / trackSpan /
+     * frameCount each walked all of them on every call (seek, playback, hit-test, group geometry).
+     */
+    val celRel: Map<Int, IntArray> by derivedStateOf {
+        val out = HashMap<Int, IntArray>()
+        for ((t, row) in celsByTrack) {
+            val rel = IntArray(row.size + 1)
+            for (i in row.indices) rel[i + 1] = rel[i] + row[i].len
+            out[t] = rel
+        }
+        out
+    }
+
+    /**
+     * Content span of every group - first member start .. last member end, in frames - taken from the REAL drawings and the
+     * real audio clips (a Loop's audio repeat copies are left out). Rebuilt once per edit: Re-timing asks it for every row
+     * on every frame, so a lookup must be O(1).
+     */
+    private val groupSpans: Map<Int, Pair<Int, Int>> by derivedStateOf {
+        val out = HashMap<Int, Pair<Int, Int>>()
+        for (grp in groups) {
+            var a = Int.MAX_VALUE
+            var b = Int.MIN_VALUE
+            for (t in drawTracks) if (t.group == grp.id) {
+                val rel = celRel[t.id] ?: continue
+                val len = rel[rel.size - 1]
+                if (len <= 0) continue
+                a = minOf(a, t.offset); b = maxOf(b, t.offset + len)
+            }
+            val audio = timeline.tracks.filter { it.group == grp.id }.mapTo(HashSet()) { it.id }
+            if (audio.isNotEmpty()) for (c in timeline.clips) if (!c.gen && c.track in audio) {
+                a = minOf(a, msToFrame(c.startMs)); b = maxOf(b, msToFrame(c.startMs + c.lenMs))
+            }
+            if (a <= b) out[grp.id] = a to b
+        }
+        out
+    }
+
+    val frameCount: Int get() {
+        var best = 1
+        for (t in drawTracks) best = maxOf(best, t.offset + trackSpan(t.id))
+        for (g in groups) if (g.fill != FILL_NONE) best = maxOf(best, g.endFrame)   // Loop / Freeze / ... play on up to the bar end
+        return best
+    }
 
     /** Layers of the ACTIVE drawing row (every row has its own set). */
     val layers: List<Layer> get() = layersOf(activeTrack)
@@ -327,7 +569,27 @@ class EditorState {
     /** Native keeps the same number of layer slots for every row: the largest layer count of any row. */
     val layerSlots: Int get() = drawTracks.maxOfOrNull { it.layers.size } ?: 0
     fun newLayerId(): Int = (drawTracks.maxOfOrNull { t -> t.layers.maxOfOrNull { it.id } ?: -1 } ?: -1) + 1
+    
+    /** Image being placed (not in history until applied), and the ••• / Layers menu -> picker request flag. */
+    var placing by mutableStateOf<ImagePlacing?>(null)
+    var imagePickRequested by mutableStateOf(false)
+    val canImportImage: Boolean get() = canDrawHere && projectId != null
 
+    fun applyPlacing() {
+        val p = placing ?: return
+        placing = null
+        strokes.add(InkStroke(p.cel, p.layer, Color.Black, 0f, emptyList(), false, ImagePlace(p.name, p.cx, p.cy, p.w, p.h, p.rot)))
+        pushOp(HistoryOp.Stroke)   // one undo step; native history mirrors it (Op::AddImage)
+        NativeCanvas.addImage(p.cel, nativeLayer(p.track, p.layer), ImageStore.handleOf(p.name), p.cx, p.cy, p.w, p.h, p.rot)
+    }
+
+    fun cancelPlacing() {
+        val p = placing ?: return
+        placing = null
+        ImageStore.release(p.name)
+        p.file.delete()
+    }
+    
     private fun editLayers(track: Int, f: (List<Layer>) -> List<Layer>) {
         val i = drawTracks.indexOfFirst { it.id == track }
         if (i >= 0) drawTracks[i] = drawTracks[i].copy(layers = f(drawTracks[i].layers))
@@ -337,7 +599,7 @@ class EditorState {
     private fun remapLayers(from: List<Layer>): Pair<List<Layer>, Map<Int, Int>> {
         var next = newLayerId()
         val map = HashMap<Int, Int>()
-        val out = from.map { l -> Layer(next, l.name, l.visible).also { map[l.id] = next; next++ } }
+        val out = from.map { l -> l.copy(id = next).also { map[l.id] = next; next++ } }
         return out to map
     }
 
@@ -380,13 +642,16 @@ class EditorState {
 
     var clipboard by mutableStateOf<Clipboard?>(null)
 
+    // A Loop's audio repeat copies (AudioClip.gen) are DERIVED data (refreshLoops rebuilds them after every edit / undo / redo),
+    // so they are left out of the undo snapshots. Drawings are never copied by Re-timing, there is nothing else to leave out.
     fun snapshot() = EditSnap(
-        timeline.clips.toList(), timeline.tracks.toList(), cels.toList(), drawTracks.toList(),
-        strokes.toList(), timeline.selectedClip,
+        timeline.clips.filter { !it.gen }, timeline.tracks.toList(), cels.toList(), drawTracks.toList(),
+        strokes.toList(), timeline.selectedClip, groups.toList(),
     )
 
     /** Close a finished edit/gesture: pushes one undo step if anything changed since [before]. */
     fun commitEdit(before: EditSnap) {
+        refreshLoops() // the audio repeats of looping groups follow the edit
         val after = snapshot()
         if (before.sameAs(after)) return
         val hadRedo = redoStack.isNotEmpty()
@@ -404,20 +669,135 @@ class EditorState {
     }
 
     /** Changes when the native layer table must be rebuilt: row order / row list / layer list (+ visibility). */
-    fun structureKey(): Any = listOf(drawTracks.map { it.id }, drawTracks.map { it.layers })
+    fun structureKey(): Any = listOf(drawTracks.map { it.id }, drawTracks.map { it.layers.map { l -> listOf(l.id, l.name, l.visible) } })
+
+    /** Changes when any blend / opacity / clipping setting changes (cheap update, no replay). */
+    fun fxKey(): Any = listOf(
+        drawTracks.map { t -> listOf(t.blend, t.opacity, t.clip, t.group, t.layers.map { l -> listOf(l.blend, l.opacity, l.clip) }) },
+        groups.map { listOf(it.id, it.blend, it.opacity, it.clip) },
+    )
+
+    /** Blend / opacity / clipping of every drawing layer (by native layer id) and row -> native. */
+    fun syncFx() {
+        val rows = drawTracks.toList()
+        val n = layerSlots
+        if (rows.isEmpty() || n == 0) return
+        fun layerAt(i: Int) = rows[i / n].layers.getOrNull(i % n)
+        NativeCanvas.setFx(
+            IntArray(rows.size * n) { layerAt(it)?.blend ?: 0 },
+            FloatArray(rows.size * n) { layerAt(it)?.opacity ?: 1f },
+            BooleanArray(rows.size * n) { layerAt(it)?.clip ?: false },
+            IntArray(rows.size) { rows[it].blend },
+            FloatArray(rows.size) { rows[it].opacity },
+            BooleanArray(rows.size) { rows[it].clip },
+        )
+        val gs = groups.toList()
+        NativeCanvas.setGroupFx(
+            IntArray(rows.size) { i -> rows[i].group.takeIf { g -> gs.any { it.id == g } } ?: -1 },
+            IntArray(gs.size) { gs[it].id }, IntArray(gs.size) { gs[it].blend }, FloatArray(gs.size) { gs[it].opacity }, BooleanArray(gs.size) { gs[it].clip },
+        )
+    }
+
+    /** The same data for the exporter: `state.exportFx().applyTo(handle)` after NativeExporter.nativeCreate, before nativeRun. */
+    fun exportFx(): ExportFx {
+        val rows = drawTracks.toList()
+        val ls = rows.flatMap { it.layers }
+        return ExportFx(
+            IntArray(rows.size) { rows[it].blend }, FloatArray(rows.size) { rows[it].opacity }, BooleanArray(rows.size) { rows[it].clip },
+            IntArray(ls.size) { ls[it].id }, IntArray(ls.size) { ls[it].blend }, FloatArray(ls.size) { ls[it].opacity }, BooleanArray(ls.size) { ls[it].clip },
+            IntArray(rows.size) { i -> rows[i].group.takeIf { g -> groups.any { it.id == g } } ?: -1 },
+            IntArray(groups.size) { groups[it].id }, IntArray(groups.size) { groups[it].blend },
+            FloatArray(groups.size) { groups[it].opacity }, BooleanArray(groups.size) { groups[it].clip },
+        )
+    }
+
+    // ---- blend / clipping (Blend dialog + the Blend / Clipping menu items)
+
+    var fxTarget by mutableStateOf<FxTarget?>(null)
+    /** Bumped to open the ••• editing menu for the active row (menu item "Edit Track"). */
+    var editMenuTick by mutableIntStateOf(0)
+
+    fun openTrackMenu(track: Int) { activeTrack = track; editMenuTick++ }
+
+    private fun layerOf(id: Int): Layer? = drawTracks.firstNotNullOfOrNull { t -> t.layers.firstOrNull { it.id == id } }
+    fun fxModeOf(t: FxTarget): Int = when (t) { is FxTarget.Row -> drawTracks.firstOrNull { it.id == t.id }?.blend; is FxTarget.Lay -> layerOf(t.id)?.blend; is FxTarget.Grp -> groupById(t.id)?.blend } ?: 0
+    fun fxOpacityOf(t: FxTarget): Float = when (t) { is FxTarget.Row -> drawTracks.firstOrNull { it.id == t.id }?.opacity; is FxTarget.Lay -> layerOf(t.id)?.opacity; is FxTarget.Grp -> groupById(t.id)?.opacity } ?: 1f
+    fun fxClipOf(t: FxTarget): Boolean = when (t) { is FxTarget.Row -> drawTracks.firstOrNull { it.id == t.id }?.clip; is FxTarget.Lay -> layerOf(t.id)?.clip; is FxTarget.Grp -> groupById(t.id)?.clip } ?: false
+    fun fxNameOf(t: FxTarget): String = when (t) { is FxTarget.Row -> drawTracks.firstOrNull { it.id == t.id }?.name; is FxTarget.Lay -> layerOf(t.id)?.name; is FxTarget.Grp -> groupById(t.id)?.name } ?: ""
+
+    /** Raw change (no history): a slider drag wraps it in snapshot() + commitEdit(); discrete taps wrap it in edit { }. */
+    fun setFxRaw(t: FxTarget, blend: Int? = null, opacity: Float? = null, clip: Boolean? = null) {
+        when (t) {
+            is FxTarget.Row -> {
+                val i = drawTracks.indexOfFirst { it.id == t.id }
+                if (i >= 0) drawTracks[i] = drawTracks[i].let { it.copy(blend = blend ?: it.blend, opacity = opacity ?: it.opacity, clip = clip ?: it.clip) }
+            }
+            is FxTarget.Lay -> {
+                val tr = drawTracks.firstOrNull { r -> r.layers.any { it.id == t.id } }?.id ?: return
+                editLayers(tr) { ls -> ls.map { if (it.id == t.id) it.copy(blend = blend ?: it.blend, opacity = opacity ?: it.opacity, clip = clip ?: it.clip) else it } }
+            }
+            is FxTarget.Grp -> {
+                val i = groups.indexOfFirst { it.id == t.id }
+                if (i >= 0) groups[i] = groups[i].let { it.copy(blend = blend ?: it.blend, opacity = opacity ?: it.opacity, clip = clip ?: it.clip) }
+            }
+        }
+    }
+
+    fun toggleClip(t: FxTarget) = edit { setFxRaw(t, clip = !fxClipOf(t)) }
 
     /** Changes when any row's transform changes (cheap update, no replay). */
-    fun xfKey(): Any = drawTracks.map { listOf(it.xf, it.keys, it.offset) }
+    fun xfKey(): Any = listOf(drawTracks.map { listOf(it.xf, it.keys, it.offset) }, retimeKey())
 
     /** Changes when any rig (bones, curves, keys, mesh, paint) changes -> resend to native. */
-    fun rigKey(): Any = drawTracks.map { it.rig to it.attach }
+    fun rigKey(): Any = drawTracks.map { it.rig to it.attach } to retimeKey()
+
+    /** Everything the live key re-timing depends on: mode, bar end AND the content span (a trimmed / moved drawing changes the period). */
+    private fun retimeKey(): Any = groups.map { listOf(it.id, it.fill, it.endFrame, groupSpans[it.id]) }
+
+    // Packed animation data of the last syncXf(), kept so syncTime() can re-send just the row offsets (see nativeOffsets).
+    private var animN = 0
+    private var animCounts = IntArray(0)
+    private var animStatics = FloatArray(0)
+    private var animKeys = FloatArray(0)
+    private var animOffsets = IntArray(0)   // the offsets native holds right now
+
+    /** Rows that could not be baked (see [liveRows]): they still use the offset shift of [nativeOffsets]. */
+    private var animShift = BooleanArray(0)
+
+    /**
+     * The rows as NATIVE must evaluate them at the global playhead (native time - row offset = the row's local frame).
+     *  - Stretch / Loop / Loop & Stretch: transform keys AND rig keys are re-timed by [retimeKeys], the same function the
+     *    exporter uses, so the canvas equals the export. Stretch used to sample the source at whole frames (stepped, held) and
+     *    a rig's keys were not re-timed at all.
+     *  - Freeze / Blank / Off: nothing to do, a curve holds its last value by itself (no per-frame re-send any more).
+     *  - A channel with one key is constant: it is passed through (a 1-frame drawing can only hold keys on frame 0).
+     * [shift] gets true for a row whose unrolled Loop would exceed [BAKE_MAX_KEYS]; it keeps the (once per repeat) offset shift.
+     */
+    internal fun liveRows(shift: BooleanArray? = null): List<DrawTrack> {
+        val rows = drawTracks.toList()
+        return rows.mapIndexed { i, r ->
+            if (r.keys.isEmpty() && r.rig.keys.isEmpty()) return@mapIndexed r
+            val g = if (r.group < 0) null else groupById(r.group)
+            val span = if (g == null || g.fill == FILL_NONE) null else groupSpans[g.id]
+            if (g == null || span == null) return@mapIndexed r
+            if (g.fill != FILL_STRETCH && g.fill != FILL_LOOP && g.fill != FILL_LOOP_STRETCH) return@mapIndexed r
+            val end = groupBarEndFrame(g.id)
+            val reps = retimeRepeats(g.fill, span.first, span.second, end)
+            if (reps.toLong() * (r.keys.size + r.rig.keys.size) > BAKE_MAX_KEYS) { if (shift != null && i < shift.size) shift[i] = true; return@mapIndexed r }
+            r.copy(
+                keys = retimeKeys(r.keys, r.offset, g.fill, span.first, span.second, end),
+                rig = if (r.rig.keys.isEmpty()) r.rig else r.rig.copy(keys = retimeKeys(r.rig.keys, r.offset, g.fill, span.first, span.second, end)),
+            )
+        }
+    }
 
     /**
      * Send every row's static transform, start offset and keyframes to the native canvas. Native evaluates the
      * curves itself (easing included) at the time set by [syncTime], so playback / scrubbing costs one float.
      */
     fun syncXf() {
-        val rows = drawTracks.toList()
+        val shift = BooleanArray(drawTracks.size)
+        val rows = liveRows(shift)
         val n = layerSlots
         if (rows.isEmpty() || n == 0) return
         val statics = FloatArray(rows.size * 7)
@@ -425,21 +805,45 @@ class EditorState {
         val keys = FloatArray(rows.sumOf { it.keys.size } * KEY_STRIDE)
         var o = 0
         for (r in rows) { r.packedKeys.copyInto(keys, o); o += r.packedKeys.size }
-        NativeCanvas.setAnim(
-            n, IntArray(rows.size) { rows[it].offset }, IntArray(rows.size) { rows[it].keys.size }, statics, keys,
-        )
+        animN = n
+        animCounts = IntArray(rows.size) { rows[it].keys.size }
+        animStatics = statics
+        animKeys = keys
+        animShift = shift
+        animOffsets = IntArray(0)   // forces the send below
         syncTime()
     }
 
-    /** Playhead -> native (it re-evaluates every row's curve on the GL thread). */
-    fun syncTime() = NativeCanvas.setTime(frame.toFloat())
+    /**
+     * Row start as NATIVE must see it. Only a row that [liveRows] could not bake (a huge Loop with many keys) is shifted by
+     * (playhead - source frame), so native's (time - offset) is the source frame the group shows now. Every other row keeps
+     * its real start, so [offs] is the same on every frame and nothing is re-sent while playing.
+     */
+    private fun nativeOffsets(rows: List<DrawTrack>): IntArray = IntArray(rows.size) { i ->
+        val r = rows[i]
+        if (i >= animShift.size || !animShift[i]) r.offset
+        else rowFrame(r.id, frame).let { m -> if (m < 0) r.offset else r.offset + (frame - m) }
+    }
+
+    /** Playhead -> native (it re-evaluates every row's curve on the GL thread). Re-sends the offsets only when a Re-timing shift changed. */
+    fun syncTime() {
+        val rows = drawTracks.toList()
+        if (rows.isNotEmpty() && animCounts.size == rows.size) {
+            val offs = nativeOffsets(rows)
+            if (!offs.contentEquals(animOffsets)) {
+                animOffsets = offs
+                NativeCanvas.setAnim(animN, offs, animCounts, animStatics, animKeys)
+            }
+        }
+        NativeCanvas.setTime(frame.toFloat())
+    }
 
     // ---------------------------------------------------------------- layer transform
     /** The row's pose at the playhead. Animated rows ask C++ for it (curve + easing), so UI and canvas always agree. */
     fun trackXf(track: Int): LayerXf {
         val t = drawTracks.firstOrNull { it.id == track } ?: return LayerXf()
         if (t.keys.isEmpty()) return t.xf
-        val v = NativeCanvas.evalXf(t.packedKeys, t.keys.size, (frame - t.offset).toFloat(), t.baseArray())
+        val v = NativeCanvas.evalXf(t.packedKeys, t.keys.size, localTime(track), t.baseArray())
         return LayerXf(v[0], v[1], v[2], v[3], v[4], v[5], v[6])
     }
 
@@ -461,7 +865,7 @@ class EditorState {
         if (next.px != cur.px || next.py != cur.py) { rebasePivot(i, Offset(next.px, next.py)); return }
         var xf = t.xf
         var keys = t.keys
-        val local = frame - t.offset
+        val local = localFrame(track)
         for (c in Chan.values()) {
             if (next.get(c) == cur.get(c)) continue
             if (keys.any { it.chan == c.id }) keys = upsertKey(keys, c, local, next.get(c), null, trackSpan(t.id))
@@ -521,10 +925,31 @@ class EditorState {
     fun trackKeys(track: Int = activeTrack): List<ChanKey> = drawTracks.firstOrNull { it.id == track }?.keys ?: emptyList()
     fun laneKeys(track: Int, c: Chan): List<ChanKey> = trackKeys(track).filter { it.chan == c.id }
     fun isAnimated(track: Int = activeTrack) = trackKeys(track).isNotEmpty()
-    fun localFrame(track: Int = activeTrack, f: Int = frame) = f - trackOffset(track)
+    /** Row-local frame the keys are read at: the SOURCE frame when the row sits in a re-timed group (see [rowFrame]). */
+    fun localFrame(track: Int = activeTrack, f: Int = frame) = rowFrame(track, f).let { if (it < 0) f else it } - trackOffset(track)
+
+    /**
+     * Row-local SOURCE time at [f], fractional. Stretch / Loop & Stretch map the playhead to a point BETWEEN two source frames;
+     * the gizmo, sliders and rig pose read the keys there, so they agree with the smooth canvas ([liveRows]). Else = [localFrame].
+     */
+    fun localTime(track: Int = activeTrack, f: Int = frame): Float {
+        val t = drawTracks.firstOrNull { it.id == track }
+        val g = if (t == null || t.group < 0) null else groupById(t.group)
+        val span = if (g == null) null else groupSpans[g.id]
+        if (t == null || g == null || span == null || (g.fill != FILL_STRETCH && g.fill != FILL_LOOP_STRETCH)) return localFrame(track, f).toFloat()
+        val a = span.first
+        val e = maxOf(g.endFrame, span.second)
+        val p = (span.second - a).toLong()
+        val l = (e - a).toLong()
+        if (p <= 0L || l <= 0L || f < a || f >= e) return localFrame(track, f).toFloat()
+        val x = (f - a).toLong()
+        val m = if (g.fill == FILL_STRETCH) a + x.toDouble() * p / l
+        else { val n = maxOf(1L, (l + p / 2) / p); a + ((x * n) % l).toDouble() * p / l }
+        return (m - t.offset).toFloat()
+    }
 
     /** Drawing frames in the row (keys beyond this would sit where the row is already gone). */
-    fun trackSpan(track: Int): Int = cels.sumOf { if (it.track == track) it.len else 0 }
+    fun trackSpan(track: Int): Int = celRel[track]?.let { it[it.size - 1] } ?: 0
 
     /** 0 = not animated, 1 = animated (no key under the playhead), 2 = a key sits under the playhead. Drives the icon. */
     fun keyState(p: PropRef): Int = when (p) {
@@ -707,6 +1132,17 @@ class EditorState {
         var x0 = Float.MAX_VALUE; var y0 = Float.MAX_VALUE; var x1 = -Float.MAX_VALUE; var y1 = -Float.MAX_VALUE
         for (s in strokes) {
             if (s.erase || s.cel !in ids) continue
+            val im = s.image
+            if (im != null) {
+                val r = im.rot * 0.017453292f
+                val ex = abs(cos(r)) * im.w / 2f + abs(sin(r)) * im.h / 2f
+                val ey = abs(sin(r)) * im.w / 2f + abs(cos(r)) * im.h / 2f
+                if (im.cx - ex < x0) x0 = im.cx - ex
+                if (im.cy - ey < y0) y0 = im.cy - ey
+                if (im.cx + ex > x1) x1 = im.cx + ex
+                if (im.cy + ey > y1) y1 = im.cy + ey
+                continue
+            }
             val r = s.size / 512f * 0.5f
             for (p in s.pts) {
                 if (p.x - r < x0) x0 = p.x - r
@@ -747,11 +1183,11 @@ class EditorState {
     }
 
     /** Changes when playback or seeking makes some row show another drawing (cheap update, no replay). */
-    fun shownKey(): Any = drawTracks.map { celAt(frame, it.id)?.id }
+    fun shownKey(): Any = drawTracks.map { celAt(frame, it.id)?.shownId() }
 
     /** Tell native which drawing each row shows now; it redraws only the layers whose drawing changed. */
     fun syncShown() {
-        NativeCanvas.setShown(drawTracks.mapNotNull { celAt(frame, it.id)?.id }.toIntArray())
+        NativeCanvas.setShown(drawTracks.mapNotNull { celAt(frame, it.id)?.shownId() }.toIntArray())
     }
 
     /**
@@ -759,7 +1195,7 @@ class EditorState {
      * which drawings are on screen. Native keeps one lazily-allocated texture per (row, layer) that has something
      * to show and composites them all bottom -> top in a single GL surface.
      */
-    fun rebuildNative() {
+    fun rebuildNative(blob: Long = 0L) {
         NativeCanvas.resetStrokes()
         val rows = drawTracks.toList()
         val n = layerSlots
@@ -768,12 +1204,29 @@ class EditorState {
             // a row with fewer layers than the widest row leaves its spare slots hidden
             BooleanArray(rows.size * n) { rows[it / n].layers.getOrNull(it % n)?.visible ?: false },
         )
+        syncFx()
         syncXf()
         syncRig()
         syncShown() // before the strokes, so they are drawn straight into the right layers
+        // Project load: [blob] = the natively parsed strokes.bin, identical to [strokes] (no redo yet). The canvas takes it
+        // straight from native memory: no FloatArray per stroke, no JNI call per stroke.
+        if (blob != 0L && redoStack.isEmpty()) {
+            val rowIdx = HashMap<Int, Int>().also { m -> rows.forEachIndexed { i, t -> m[t.id] = i } }
+            val celRow = IntArray(cels.size * 2)
+            for (i in cels.indices) { celRow[i * 2] = cels[i].id; celRow[i * 2 + 1] = rowIdx[cels[i].track] ?: 0 }
+            val layerTab = IntArray(rows.size * n) { Int.MIN_VALUE }
+            rows.forEachIndexed { r, t -> t.layers.forEachIndexed { k, l -> if (k < n) layerTab[r * n + k] = l.id } }
+            val files = NativeProject.nativeImageFiles(blob)
+            if (NativeCanvas.addStrokesFromBlob(blob, celRow, layerTab, n, IntArray(files.size) { ImageStore.handleOf(files[it]) })) return
+        }
         val trackOf = HashMap<Int, Int>().also { m -> cels.forEach { m[it.id] = it.track } }
         fun push(st: InkStroke): Boolean {
             val track = trackOf[st.cel] ?: return false
+            val im = st.image
+            if (im != null) {   // handle -1 (file missing) draws nothing but keeps native history aligned with strokes
+                NativeCanvas.addImage(st.cel, nativeLayer(track, st.layer), ImageStore.handleOf(im.file), im.cx, im.cy, im.w, im.h, im.rot)
+                return true
+            }
             val xy = FloatArray(st.pts.size * 2)
             for (i in st.pts.indices) { xy[i * 2] = st.pts[i].x; xy[i * 2 + 1] = st.pts[i].y }
             NativeCanvas.addStroke(st.cel, nativeLayer(track, st.layer), st.color.toArgb(), st.size, st.erase, xy)
@@ -825,6 +1278,9 @@ class EditorState {
             timeline.clips.clear(); timeline.clips.addAll(s.clips)
             timeline.tracks.clear(); timeline.tracks.addAll(s.tracks)
             cels.clear(); cels.addAll(s.cels)
+            groups.clear(); groups.addAll(s.groups)
+            collapsedGroups.removeAll { id -> s.groups.none { it.id == id } }
+            if (selectedGroup >= 0 && s.groups.none { it.id == selectedGroup }) selectedGroup = -1
             drawTracks.clear(); drawTracks.addAll(s.drawTracks)
             if (drawTracks.none { it.id == activeTrack }) activeTrack = drawTracks.firstOrNull()?.id ?: 0
             if (strokesChanged) { strokes.clear(); strokes.addAll(s.strokes) }
@@ -833,11 +1289,12 @@ class EditorState {
         timeline.pushToNative()
         seek(frame) // cels may have shrunk
         if (strokesChanged) rebuildNative()
+        refreshLoops()   // audio repeats follow the restored state
     }
 
     /** The native layer already holds the stroke that was drawn live; this only closes it into history. */
     fun commit(s: InkStroke) {
-        strokes.add(s)
+        strokes.add(s)   // re-timed groups show the source drawing itself: nothing to regenerate
         pushOp(HistoryOp.Stroke)
         NativeCanvas.endStroke()
     }
@@ -884,19 +1341,24 @@ class EditorState {
     val activeLocked: Boolean get() = activeTrackObj?.locked == true
 
     /** Can a stroke be started right now? (row exists, unlocked, and has a drawing under the playhead) */
-    val canDrawHere: Boolean get() = activeTrackObj?.locked == false && currentCel != null
+    val canDrawHere: Boolean get() = activeTrackObj?.locked == false && currentCel != null && !currentIsGenerated
 
-    fun trackCels(track: Int = activeTrack): List<Cel> = cels.filter { it.track == track }
+    /** The playhead is on a re-timed frame (a repeat, a stretched / frozen part): look only, edit the source instead. */
+    val currentIsGenerated: Boolean get() = rowFrame(activeTrack, frame) != frame
+
+    fun trackCels(track: Int = activeTrack): List<Cel> = celsByTrack[track] ?: emptyList()
     /** Frame where [track]'s first drawing starts. */
     fun trackOffset(track: Int): Int = drawTracks.firstOrNull { it.id == track }?.offset ?: 0
 
     /** Frame where [track] ends (offset + all its holds). */
-    fun trackLen(track: Int): Int = trackOffset(track) + cels.sumOf { if (it.track == track) it.len else 0 }
+    fun trackLen(track: Int): Int = trackOffset(track) + trackSpan(track)
 
     /** Raw move of a whole row to start at [offset] (no history; wrap in [edit] / commitEdit). */
     fun setTrackOffset(track: Int, offset: Int) {
         val i = drawTracks.indexOfFirst { it.id == track }
-        if (i >= 0) drawTracks[i] = drawTracks[i].copy(offset = offset.coerceAtLeast(0))
+        if (i < 0) return
+        val o = offset.coerceAtLeast(0)
+        if (drawTracks[i].offset != o) drawTracks[i] = drawTracks[i].copy(offset = o)   // no-op steps must not invalidate every observer
     }
 
     /** Nudge the active row by [d] frames; the playhead goes with it so the same drawing stays selected. One undo step. */
@@ -909,33 +1371,33 @@ class EditorState {
 
     /** Index (inside [track]) of the drawing shown at frame [f]; -1 before the row starts or after it has ended. */
     fun celIndexAt(f: Int, track: Int = activeTrack): Int {
-        val start = trackOffset(track)
-        if (f < start) return -1
-        var end = start
-        var i = 0
-        for (c in cels) {
-            if (c.track != track) continue
-            end += c.len
-            if (f < end) return i
-            i++
+        val r = f - trackOffset(track)
+        if (r < 0) return -1
+        val rel = celRel[track] ?: return -1
+        val n = rel.size - 1
+        if (n <= 0 || r >= rel[n]) return -1
+        // binary search: last cel whose start is <= r (was a linear walk over every generated copy)
+        var lo = 0
+        var hi = n - 1
+        while (lo < hi) {
+            val mid = (lo + hi + 1) ushr 1
+            if (rel[mid] <= r) lo = mid else hi = mid - 1
         }
-        return -1
+        return lo
     }
 
     fun celStart(i: Int, track: Int = activeTrack): Int {
-        var a = trackOffset(track)
-        var k = 0
-        for (c in cels) {
-            if (c.track != track) continue
-            if (k == i) break
-            a += c.len
-            k++
-        }
-        return a
+        val a = trackOffset(track)
+        val rel = celRel[track] ?: return a
+        return a + rel[i.coerceIn(0, rel.size - 1)]
     }
 
-    fun celAt(f: Int, track: Int = activeTrack): Cel? =
-        celIndexAt(f, track).let { if (it < 0) null else trackCels(track)[it] }
+    /** The drawing row [track] SHOWS at timeline frame [f]: goes through the group's Re-timing ([rowFrame]) first. */
+    fun celAt(f: Int, track: Int = activeTrack): Cel? {
+        val m = rowFrame(track, f)
+        if (m < 0) return null
+        return celIndexAt(m, track).let { if (it < 0) null else trackCels(track)[it] }
+    }
 
     val currentCel: Cel? get() = celAt(frame)
 
@@ -974,11 +1436,37 @@ class EditorState {
     private fun newTrackId() = (drawTracks.maxOfOrNull { it.id } ?: -1) + 1
 
     /** New empty drawing row above the active one, one blank drawing as long as the whole timeline. */
-    fun addDrawTrack() = edit {
+    fun addDrawTrack() = edit { addDrawTrackRaw(-1) } // the + menu always adds a top-level row, never one inside a folder
+
+    /** New drawing row INSIDE group [g] (only from that group's ••• menu): on top of the folder, or right above the active row when it is a member. */
+    fun addDrawTrackIn(g: Int) = edit { if (groupById(g) != null) addDrawTrackRaw(g) }
+
+    /** Group a PASTED drawing row joins: the active row's folder (it lands next to it, so the block stays whole). */
+    private fun joinGroup(): Int = activeTrackObj?.group?.takeIf { groupById(it) != null } ?: -1
+
+    /**
+     * Slot in [drawTracks] (bottom -> top) for a new row of group [g]: above the active row if it is a member, else on top of
+     * the folder. A top-level row ([g] < 0) goes just ABOVE the whole folder when the active row sits inside one, so it never splits it.
+     */
+    private fun joinSlot(g: Int): Int {
+        val ai = drawTracks.indexOfFirst { it.id == activeTrack }
+        if (g < 0) drawTracks.getOrNull(ai)?.group?.takeIf { groupById(it) != null }?.let { ag -> return drawTracks.indexOfLast { it.group == ag } + 1 }
+        if (g >= 0 && drawTracks.getOrNull(ai)?.group != g) {
+            val top = drawTracks.indexOfLast { it.group == g }
+            if (top >= 0) return top + 1
+        }
+        return if (ai < 0) drawTracks.size else ai + 1
+    }
+
+    private fun addDrawTrackRaw(grp: Int) {
         val id = newTrackId()
-        val at = drawTracks.indexOfFirst { it.id == activeTrack }.let { if (it < 0) drawTracks.size else it + 1 }
-        drawTracks.add(at, DrawTrack(id, "Drawing ${id + 1}", layers = remapLayers(layers.ifEmpty { listOf(Layer(0, "Body")) }.map { it.copy(visible = true) }).first))
-        cels.add(Cel(newCelId(), frameCount, id))
+        val at = joinSlot(grp)
+        // a row that joins a live Loop / Freeze group is as long as the group's source: a timeline-long drawing would stretch the loop period
+        val span = if (grp >= 0 && groupById(grp)?.fill != FILL_NONE) groupSourceSpan(grp) else null
+        val len = span?.let { (it.second - it.first).coerceAtLeast(1) } ?: frameCount
+        drawTracks.add(at, DrawTrack(id, "Drawing ${id + 1}", offset = span?.first ?: 0, group = grp, layers = remapLayers(layers.ifEmpty { listOf(Layer(0, "Body")) }.map { it.copy(visible = true) }).first))
+        cels.add(Cel(newCelId(), len, id))
+        gatherDrawGroups() // the folder stays ONE block
         activeTrack = id
     }
 
@@ -989,8 +1477,8 @@ class EditorState {
         val src = drawTracks[i]
         val id = newTrackId()
         val (ls, map) = remapLayers(src.layers)
-        drawTracks.add(i + 1, DrawTrack(id, "${src.name} copy", offset = src.offset, xf = src.xf, keys = src.keys, rig = src.rig, attach = src.attach, layers = ls))
-        for (c in trackCels(src.id)) {
+        drawTracks.add(i + 1, DrawTrack(id, "${src.name} copy", offset = src.offset, xf = src.xf, keys = src.keys, rig = src.rig, attach = src.attach, layers = ls, group = src.group))
+        for (c in trackCels(src.id).filter { it.gen == -1 }) {
             val nid = newCelId()
             cels.add(Cel(nid, c.len, id))
             strokes.addAll(strokesOf(c.id).map { it.copy(cel = nid, layer = map[it.layer] ?: it.layer) })
@@ -1008,6 +1496,7 @@ class EditorState {
         strokes.removeAll { it.cel in dead }
         cels.removeAll { it.track == id }
         drawTracks.removeAt(i)
+        pruneGroups()
         activeTrack = drawTracks[i.coerceAtMost(drawTracks.lastIndex)].id
         seek(frame)
     }
@@ -1021,13 +1510,411 @@ class EditorState {
         if (from < 0) return@edit
         val to = (drawTracks.lastIndex - toSlot).coerceIn(0, drawTracks.lastIndex)
         if (to != from) drawTracks.add(to, drawTracks.removeAt(from))
+        gatherDrawGroups() // a plain move must never split a group's block
+    }
+
+    // ------------------------------------------------------------------ groups (folders of tracks)
+    // A group is a folder: drawing rows and audio layers join it through their `group` field. It has no transform,
+    // so the canvas and the export are untouched. Drawing members of a group always sit next to each other in
+    // [drawTracks] (the group is ONE block of the stack); audio layers can be anywhere in the audio list because
+    // their order does not change the mix. Every public op that changes membership is ONE undo step.
+
+    val groups = mutableStateListOf<TrackGroup>()
+    /** Closed folders. UI only: opening / closing is not an undo step. */
+    val collapsedGroups = mutableStateListOf<Int>()
+    /** The group whose bar is selected on the timeline (drag it to move every member in time). UI only. */
+    var selectedGroup by mutableIntStateOf(-1)
+    /** Set by the timeline (long-press on a name tag, group menu); the timeline shows the dialog. */
+    var renameTarget by mutableStateOf<RenameTarget?>(null)
+
+    fun groupById(id: Int): TrackGroup? = if (id < 0) null else groups.firstOrNull { it.id == id }
+    fun isCollapsed(g: Int) = g in collapsedGroups
+    fun toggleCollapsed(g: Int) { if (!collapsedGroups.remove(g)) collapsedGroups.add(g) }
+    private fun newGroupId() = (groups.maxOfOrNull { it.id } ?: -1) + 1
+
+    fun groupDrawMembers(g: Int): List<DrawTrack> = drawTracks.filter { it.group == g }
+    fun groupAudioMembers(g: Int): List<AudioTrack> = timeline.tracks.filter { it.group == g }
+
+    /** Every member locked (and at least one member). */
+    fun isGroupLocked(g: Int): Boolean {
+        val d = groupDrawMembers(g)
+        val a = groupAudioMembers(g)
+        return (d.isNotEmpty() || a.isNotEmpty()) && d.all { it.locked } && a.all { it.locked }
+    }
+
+    /** True when any selected track currently sits in a group (enables "Ungroup"). */
+    val selectionInGroup: Boolean
+        get() = drawTracks.any { it.id in selDraw && groupById(it.group) != null } ||
+            timeline.tracks.any { it.id in selAudio && groupById(it.group) != null }
+
+    fun groupMembersSelected(g: Int): Boolean {
+        val d = groupDrawMembers(g)
+        val a = groupAudioMembers(g)
+        return (d.isNotEmpty() || a.isNotEmpty()) && d.all { it.id in selDraw } && a.all { it.id in selAudio }
+    }
+
+    /** Select-tracks mode: tapping a group selects all its members, or clears them when they were all selected. */
+    fun toggleGroupSel(g: Int) {
+        val all = groupMembersSelected(g)
+        for (t in groupDrawMembers(g)) { if (all) selDraw.remove(t.id) else if (t.id !in selDraw) selDraw.add(t.id) }
+        for (t in groupAudioMembers(g)) { if (all) selAudio.remove(t.id) else if (t.id !in selAudio) selAudio.add(t.id) }
+    }
+
+    /** Every selected track (drawing + audio) into ONE new group. The block lands where its topmost drawing row was. */
+    fun groupSelectedTracks() {
+        if (selCount == 0) return
+        edit { makeGroup(selDraw.toSet(), selAudio.toSet()) }
+        endTrackSelect()
+    }
+
+    /** The active drawing row into a new group of its own (no selection needed). */
+    fun groupActiveTrack() = edit {
+        if (drawTracks.any { it.id == activeTrack }) makeGroup(setOf(activeTrack), emptySet())
+    }
+
+    private fun makeGroup(draw: Set<Int>, audio: Set<Int>) {
+        if (draw.isEmpty() && audio.isEmpty()) return
+        val tl = timeline
+        val gid = newGroupId()
+        groups.add(TrackGroup(gid, "Group ${gid + 1}"))
+        for (i in drawTracks.indices) if (drawTracks[i].id in draw) drawTracks[i] = drawTracks[i].copy(group = gid)
+        for (i in tl.tracks.indices) if (tl.tracks[i].id in audio) tl.tracks[i] = tl.tracks[i].copy(group = gid)
+        gatherDrawGroups()
+        pruneGroups()
+        selectedGroup = gid
+    }
+
+    /** Takes the selected tracks out of their groups (select a group's header first to dissolve the whole folder). */
+    fun ungroupSelectedTracks() = edit {
+        val tl = timeline
+        for (i in drawTracks.indices) if (drawTracks[i].id in selDraw && drawTracks[i].group >= 0) drawTracks[i] = drawTracks[i].copy(group = -1)
+        for (i in tl.tracks.indices) if (tl.tracks[i].id in selAudio && tl.tracks[i].group >= 0) tl.tracks[i] = tl.tracks[i].copy(group = -1)
+        gatherDrawGroups()
+        pruneGroups()
+    }
+
+    /** Dissolves one folder: its members stay exactly where they are in the stack, just not inside a group any more. */
+    fun ungroup(g: Int) = edit {
+        val tl = timeline
+        for (i in drawTracks.indices) if (drawTracks[i].group == g) drawTracks[i] = drawTracks[i].copy(group = -1)
+        for (i in tl.tracks.indices) if (tl.tracks[i].group == g) tl.tracks[i] = tl.tracks[i].copy(group = -1)
+        pruneGroups()
+        if (selectedGroup == g) selectedGroup = -1
+    }
+
+    fun setGroupLocked(g: Int, lock: Boolean) = edit {
+        val tl = timeline
+        for (i in drawTracks.indices) if (drawTracks[i].group == g) drawTracks[i] = drawTracks[i].copy(locked = lock)
+        for (i in tl.tracks.indices) if (tl.tracks[i].group == g) tl.tracks[i] = tl.tracks[i].copy(locked = lock)
+    }
+
+    fun nameOf(t: RenameTarget): String = when (t) {
+        is RenameTarget.Draw -> drawTracks.firstOrNull { it.id == t.id }?.name
+        is RenameTarget.Audio -> timeline.tracks.firstOrNull { it.id == t.id }?.name
+        is RenameTarget.Group -> groupById(t.id)?.name
+    } ?: ""
+
+    /** Renames a drawing row, audio layer or group (one undo step). An empty name keeps the old one. */
+    fun rename(t: RenameTarget, name: String) = edit {
+        val n = name.trim().take(32)
+        if (n.isEmpty()) return@edit
+        when (t) {
+            is RenameTarget.Draw -> {
+                val i = drawTracks.indexOfFirst { it.id == t.id }
+                if (i >= 0) drawTracks[i] = drawTracks[i].copy(name = n)
+            }
+            is RenameTarget.Audio -> {
+                val i = timeline.tracks.indexOfFirst { it.id == t.id }
+                if (i >= 0) timeline.tracks[i] = timeline.tracks[i].copy(name = n)
+            }
+            is RenameTarget.Group -> {
+                val i = groups.indexOfFirst { it.id == t.id }
+                if (i >= 0) groups[i] = groups[i].copy(name = n)
+            }
+        }
+    }
+
+    /** Makes every group's drawing members ONE block of [drawTracks], placed where its topmost member was. */
+    private fun gatherDrawGroups() {
+        val topDown = drawTracks.asReversed().toList()
+        val out = ArrayList<DrawTrack>(topDown.size)
+        val done = HashSet<Int>()
+        for (t in topDown) {
+            if (groupById(t.group) == null) { out.add(t); continue }
+            if (done.add(t.group)) out.addAll(topDown.filter { it.group == t.group })
+        }
+        if (out.map { it.id } == topDown.map { it.id }) return
+        drawTracks.clear()
+        drawTracks.addAll(out.asReversed())
+    }
+
+    /** Drops groups that lost their last member and frees members that point at a group that is gone. */
+    private fun pruneGroups() {
+        val tl = timeline
+        val live = HashSet<Int>()
+        for (t in drawTracks) if (t.group >= 0) live.add(t.group)
+        for (t in tl.tracks) if (t.group >= 0) live.add(t.group)
+        groups.removeAll { it.id !in live }
+        collapsedGroups.removeAll { it !in live }
+        for (i in drawTracks.indices) if (drawTracks[i].group >= 0 && groupById(drawTracks[i].group) == null) drawTracks[i] = drawTracks[i].copy(group = -1)
+        for (i in tl.tracks.indices) if (tl.tracks[i].group >= 0 && groupById(tl.tracks[i].group) == null) tl.tracks[i] = tl.tracks[i].copy(group = -1)
+        if (selectedGroup >= 0 && groupById(selectedGroup) == null) selectedGroup = -1
+    }
+
+    /**
+     * Drag-reorder of the drawing stack, one undo step. [ctx] = the group whose members are being reordered, or -1
+     * for the top-level items (an ungrouped row, or a whole group as one block). [order] = the new TOP -> BOTTOM order
+     * of the item keys: a row's track id, or [groupKey] of a group (top level only).
+     */
+    fun reorderDrawItems(ctx: Int, order: List<Int>) = edit {
+        val topDown = drawTracks.asReversed().toList()
+        val res: List<DrawTrack>
+        if (ctx >= 0) {
+            val members = topDown.filter { it.group == ctx }
+            if (order.toSet() != members.map { it.id }.toSet() || order.size != members.size) return@edit
+            val byId = members.associateBy { it.id }
+            var k = 0
+            res = topDown.map { t -> if (t.group == ctx) byId.getValue(order[k++]) else t }
+        } else {
+            val blocks = LinkedHashMap<Int, MutableList<DrawTrack>>()
+            for (t in topDown) blocks.getOrPut(if (groupById(t.group) != null) groupKey(t.group) else t.id) { ArrayList() }.add(t)
+            if (order.toSet() != blocks.keys || order.size != blocks.size) return@edit
+            res = order.flatMap { blocks.getValue(it) }
+        }
+        if (res.map { it.id } == topDown.map { it.id }) return@edit
+        drawTracks.clear()
+        drawTracks.addAll(res.asReversed())
+    }
+
+    /**
+     * Drag-drop: puts the top-level drawing row [id] INTO group [g] (it lands on top of the folder). In a re-timed group
+     * the new member is re-timed with the others at once (it is only a mapping).
+     */
+    fun moveRowIntoGroup(id: Int, g: Int) = edit {
+        val i = drawTracks.indexOfFirst { it.id == id }
+        if (i < 0 || groupById(g) == null) return@edit
+        val t = drawTracks[i]
+        if (t.group == g || t.group >= 0) return@edit
+        drawTracks.removeAt(i)
+        val top = drawTracks.indexOfLast { it.group == g }
+        drawTracks.add(if (top >= 0) top + 1 else i.coerceAtMost(drawTracks.size), t.copy(group = g))
+        gatherDrawGroups()
+        activeTrack = id
+    }
+
+    /**
+     * Drag-drop: takes drawing row [id] OUT of its folder and puts it just above ([above]) or below the whole folder.
+     * It plays by its own time again (a group's Re-timing only applies to the rows inside it).
+     */
+    fun moveRowOutOfGroup(id: Int, above: Boolean) = edit {
+        val i = drawTracks.indexOfFirst { it.id == id }
+        if (i < 0) return@edit
+        val t = drawTracks[i]
+        val g = t.group
+        if (g < 0) return@edit
+        drawTracks.removeAt(i)
+        val last = drawTracks.indexOfLast { it.group == g }
+        val first = drawTracks.indexOfFirst { it.group == g }
+        val at = when {
+            last < 0 -> i.coerceAtMost(drawTracks.size)
+            above -> last + 1
+            else -> first
+        }
+        drawTracks.add(at, t.copy(group = -1))
+        gatherDrawGroups()
+        pruneGroups()
+        activeTrack = id
+    }
+
+    // ---- moving a whole group in time
+
+    /** Start times of the group's unlocked members: take it when a drag begins. */
+    fun beginGroupShift(g: Int): GroupShift {
+        val d = drawTracks.filter { it.group == g && !it.locked }.associate { it.id to it.offset }
+        val audio = timeline.tracks.filter { it.group == g && !it.locked }.mapTo(HashSet()) { it.id }
+        val c = timeline.clips.filter { it.track in audio }.associate { it.id to it.startMs }
+        return GroupShift(d, c)
+    }
+
+    /**
+     * Raw (wrap the drag in snapshot + commitEdit): every unlocked member starts [df] frames later (earlier when
+     * negative) than in [s]. Clamped so nothing starts before 0 and the members keep their spacing. Returns the shift used.
+     */
+    fun shiftGroup(s: GroupShift, df: Int): Int {
+        var lo = Int.MIN_VALUE
+        for (off in s.draw.values) lo = maxOf(lo, -off)
+        for (st in s.clips.values) lo = maxOf(lo, -(st * fps / 1000L).toInt())
+        val d = maxOf(df, lo)
+        for ((id, off) in s.draw) setTrackOffset(id, off + d)
+        val dMs = frameToMs(d)
+        timeline.shiftClips(s.clips, dMs)   // one pass over the clip table (was one full scan per clip)
+        return d
+    }
+
+    /** Time span in seconds of each member of [g]: one entry per drawing row, one per audio layer that has clips. */
+    fun groupMemberSpans(g: Int): List<ClosedFloatingPointRange<Float>> {
+        val out = ArrayList<ClosedFloatingPointRange<Float>>()
+        for (t in drawTracks) if (t.group == g) out.add((t.offset / fps.toFloat())..(trackLen(t.id) / fps.toFloat()))
+        for (t in timeline.tracks) if (t.group == g) {
+            val cs = timeline.clips.filter { it.track == t.id }
+            if (cs.isNotEmpty()) out.add((cs.minOf { it.startMs } / 1000f)..(cs.maxOf { it.startMs + it.lenMs } / 1000f))
+        }
+        return out
+    }
+
+    /** Content of the group in frames: (first member start, last member end); null when it has no content. */
+    fun groupFrameSpan(g: Int): Pair<Int, Int>? = groupSpans[g]
+
+    /** Same span under the name the Re-timing code uses: "source" = the real drawings / clips, never audio repeat copies. */
+    fun groupSourceSpan(g: Int): Pair<Int, Int>? = groupSpans[g]
+
+    /** Where the group bar ends now: its stretched end, or the end of its content. */
+    fun groupBarEndFrame(g: Int): Int = maxOf(groupById(g)?.endFrame ?: -1, groupSpans[g]?.second ?: 0)
+
+    // ------------------------------------------------------------------ group Re-timing
+    // Off / Freeze / Stretch / Loop / Loop & Stretch / Blank, like the Group track of Alight Motion. The group keeps ONE
+    // copy of its drawings; a time MAPPING ([retimeFrame]) decides what shows at a timeline frame, so nothing is generated
+    // and a loop of any length adds no cels, strokes, native redraws or timeline items.
+    //  - drawings: celAt() / trackXf() map the playhead through rowFrame() first.
+    //  - keyframes: native evaluates every curve at one global time, so syncTime() shifts the start offset of each animated
+    //    row by (playhead - source frame) and re-sends only when that shift changes.
+    //  - sound: the mixer has no loop flag, so Loop / Loop & Stretch still add one copy of each audio clip per repeat
+    //    (AudioClip.gen, rebuilt by refreshLoops, never in the undo history). That is a few clips, not frames.
+
+    /**
+     * The timeline frame whose content row [track] shows at timeline frame [f]: [f] itself outside a re-timed group,
+     * otherwise the source frame ([retimeFrame]), or [RETIME_BLANK] when nothing is shown. O(1).
+     */
+    fun rowFrame(track: Int, f: Int): Int {
+        val t = drawTracks.firstOrNull { it.id == track } ?: return f
+        if (t.group < 0) return f
+        val g = groupById(t.group) ?: return f
+        if (g.fill == FILL_NONE) return f
+        val span = groupSpans[g.id] ?: return f
+        val m = retimeFrame(g.fill, span.first, span.second, g.endFrame, f)
+        // Freeze holds each row's OWN last drawing (a row shorter than the group would vanish if the group's last frame were used)
+        if (g.fill == FILL_FREEZE && m >= 0 && f >= span.second) return minOf(m, trackLen(track) - 1)
+        return m
+    }
+
+    /** Kept for callers of the old generator: Re-timing is instant, so there is never anything to wait for. */
+    val genBusy: Int get() = 0
+    suspend fun awaitGeneration() {}
+
+    /** Project load: only the audio repeats of looping groups have to be (re)built; drawings are mapped, not stored. */
+    fun regenAllLoops() = refreshLoops()
+
+    /**
+     * Raw (a drag wraps it in snapshot + commitEdit): move the end of the group bar to [frame]. Off: at or before the
+     * content end = not stretched. A re-timed group can't end before its content does. The picture follows at once (it is
+     * a mapping); the audio repeats are rebuilt when the edit is committed.
+     */
+    fun setGroupEnd(g: Int, frame: Int) {
+        val i = groups.indexOfFirst { it.id == g }
+        if (i < 0) return
+        val grp = groups[i]
+        val src = groupSpans[g]?.second ?: 0
+        val end = if (grp.fill == FILL_NONE) (if (frame <= src) -1 else frame) else maxOf(frame, src)
+        if (grp.endFrame != end) groups[i] = grp.copy(endFrame = end)   // same frame as the last pointer move: no write
+    }
+
+    fun clearGroupEnd(g: Int) = edit { setGroupEnd(g, -1) }
+
+    /** While dragging the end of a Loop group: snap to whole repeats when within [tol] frames. */
+    fun snapGroupEnd(g: Int, frame: Int, tol: Int): Int {
+        val grp = groupById(g) ?: return frame
+        val span = groupSpans[g] ?: return frame
+        if (grp.fill != FILL_LOOP || frame <= span.second) return frame
+        val p = span.second - span.first
+        if (p <= 0) return frame
+        val b = span.second + Math.round((frame - span.second).toFloat() / p) * p
+        return if (abs(frame - b) <= tol) b else frame
+    }
+
+    /**
+     * Set group [g] to Re-timing [mode] (one of [RETIME_MODES]). The first time a group gets a bar longer than its
+     * content: Loop modes get one more repeat, the others one more second. A bar the user already stretched is kept.
+     * Off clears the stretch.
+     */
+    fun setGroupFill(g: Int, mode: Int) = edit {
+        val i = groups.indexOfFirst { it.id == g }
+        val span = groupSpans[g]
+        if (i < 0 || span == null) return@edit
+        val cur = groups[i]
+        if (mode == FILL_NONE) { groups[i] = cur.copy(fill = FILL_NONE, endFrame = -1); return@edit }
+        val extra = if (mode == FILL_LOOP || mode == FILL_LOOP_STRETCH) (span.second - span.first).coerceAtLeast(1) else fps
+        val end = if (cur.endFrame > span.second) cur.endFrame else span.second + extra
+        groups[i] = cur.copy(fill = mode, endFrame = end)
+    }
+
+    /** Re-timing Off. */
+    fun clearGroupFill(g: Int) = setGroupFill(g, FILL_NONE)
+
+    /**
+     * Brings the audio repeats of every Loop / Loop & Stretch group in line with its source clips and bar end. Compares
+     * with what is there and writes nothing when it is the same. (Silence for Freeze / Stretch / Blank: no copies.)
+     */
+    private fun refreshLoops() {
+        val tl = timeline
+        val want = ArrayList<AudioClip>()
+        var nid = tl.nextClipId()   // one scan of the clip table
+        for (grp in groups.toList()) loopAudio(grp, want) { nid++ }
+        val have = tl.clips.filter { it.gen }
+        if (have.size == want.size && have.indices.all { have[it].copy(id = 0) == want[it].copy(id = 0) }) return
+        Snapshot.withMutableSnapshot {
+            tl.clips.removeWhere { it.gen }
+            tl.clips.addAll(want)
+        }
+    }
+
+    /** Appends the repeat copies of [grp]'s audio clips (copies of the source clips shifted by whole periods, cut at the bar end). */
+    private fun loopAudio(grp: TrackGroup, out: MutableList<AudioClip>, newId: () -> Int) {
+        if (grp.fill != FILL_LOOP && grp.fill != FILL_LOOP_STRETCH) return
+        val span = groupSpans[grp.id] ?: return
+        val audio = groupAudioMembers(grp.id).mapTo(HashSet()) { it.id }
+        if (audio.isEmpty()) return
+        val src = timeline.clips.filter { it.track in audio && !it.gen }
+        if (src.isEmpty()) return
+        val a = span.first
+        val p = span.second - a
+        val end = groupBarEndFrame(grp.id)
+        val l = end - a
+        if (p <= 0 || l <= p) return
+        // Loop: period = the content. Loop & Stretch: the bar split into a whole number of equal repeats (sound itself is not stretched).
+        val period = if (grp.fill == FILL_LOOP) p.toDouble() else l.toDouble() / maxOf(1, (l + p / 2) / p)
+        val periodMs = period * 1000.0 / fps
+        val endMs = frameToMs(end)
+        var made = 0
+        var k = 1
+        while (made < MAX_LOOP_CLIPS) {
+            val shift = (k * periodMs).toLong()
+            var any = false
+            for (c in src) {
+                val start = c.startMs + shift
+                if (start >= endMs) continue
+                any = true
+                val len = minOf(c.lenMs, endMs - start)
+                if (len < TimelineState.MIN_CLIP_MS) continue
+                out.add(c.copy(id = newId(), startMs = start, lenMs = len, gen = true))
+                made++
+            }
+            if (!any) break
+            k++
+        }
+    }
+
+    /** Whole span of the group (first member start .. last member end), seconds; null when it has no members. */
+    fun groupSpanSec(g: Int): ClosedFloatingPointRange<Float>? {
+        val s = groupMemberSpans(g)
+        if (s.isEmpty()) return null
+        return s.minOf { it.start }..s.maxOf { it.endInclusive }
     }
 
     // ------------------------------------------------------------------ drawing (cel / frame) ops
     // Each public op is ONE undo step. Stroke edits are mirrored to the native canvas by commitEdit().
 
     private fun newCelId() = (cels.maxOfOrNull { it.id } ?: -1) + 1 // unique across ALL rows
-    private fun strokesOf(cel: Int) = strokes.filter { it.cel == cel }
+    private fun strokesOf(cel: Int): List<InkStroke> = strokesByCel[cel] ?: emptyList()
 
     fun copyCel() {
         val c = currentCel ?: return
@@ -1037,6 +1924,7 @@ class EditorState {
     fun cutCel() { copyCel(); deleteCel() }
 
     fun pasteCel() = edit {
+        if (currentIsGenerated) return@edit
         val c = clipboard as? Clipboard.CelArt ?: return@edit
         val t = activeTrack
         val at = celIndexAt(frame, t).let { if (it < 0) trackCels(t).size else it + 1 }
@@ -1048,6 +1936,7 @@ class EditorState {
 
     /** New drawing right after this one with the same hold and a copy of all its strokes. */
     fun duplicateCel() = edit {
+        if (currentIsGenerated) return@edit
         val t = activeTrack
         val i = celIndexAt(frame, t)
         if (i < 0) return@edit
@@ -1060,6 +1949,7 @@ class EditorState {
 
     /** Removes the drawing; a row's last remaining one is only cleared (a row needs at least one). */
     fun deleteCel() = edit {
+        if (currentIsGenerated) return@edit
         val t = activeTrack
         val i = celIndexAt(frame, t)
         if (i < 0) return@edit
@@ -1072,12 +1962,14 @@ class EditorState {
     }
 
     fun clearCel() = edit {
+        if (currentIsGenerated) return@edit
         val id = currentCel?.id ?: return@edit
         strokes.removeAll { it.cel == id }
     }
 
     /** Cut the hold at the playhead: the second half becomes its own drawing, starting as a copy of the first. */
     fun splitCel() = edit {
+        if (currentIsGenerated) return@edit
         val t = activeTrack
         val i = celIndexAt(frame, t)
         if (i < 0) return@edit
@@ -1101,6 +1993,7 @@ class EditorState {
     }
 
     fun moveCelBy(d: Int) = edit {
+        if (currentIsGenerated) return@edit
         val i = celIndexAt(frame)
         if (i >= 0) moveCel(i, i + d)
     }
@@ -1113,7 +2006,94 @@ class EditorState {
         return if (right) from + 1 else if (left) from - 1 else from
     }
 
+    // ---- carrying a drawing into another row / group (raw: wrap in snapshot + commitEdit)
+
+    /** The drawing the finger carries (UI only, -1 = none), the row it hovers and the group bar it hovers (-1 = none). */
+    var liftedCel by mutableIntStateOf(-1)
+    var dropTrack by mutableIntStateOf(-1)
+    var dropGroup by mutableIntStateOf(-1)
+
+    fun celTrack(celId: Int): Int = cels.firstOrNull { it.id == celId }?.track ?: -1
+
+    /** A drawing can be lifted when its row is unlocked and it is real (loop / freeze copies are regenerated, not moved). */
+    fun canLiftCel(track: Int, index: Int): Boolean {
+        val t = drawTracks.firstOrNull { it.id == track } ?: return false
+        return !t.locked && trackCels(track).getOrNull(index)?.gen == -1
+    }
+
+    /** Row a drawing dropped on group [g]'s bar goes into: the active row when it belongs to the folder, else its top row. -1 = none. */
+    fun groupDropTrack(g: Int): Int {
+        val m = drawTracks.filter { it.group == g && !it.locked }
+        return (m.firstOrNull { it.id == activeTrack } ?: m.lastOrNull())?.id ?: -1
+    }
+
+    /** Slot (0..real count) a drawing dropped with its centre at [centerFrame] takes in [track]; generated copies stay behind it. */
+    fun dropIndex(track: Int, centerFrame: Float): Int {
+        var start = trackOffset(track).toFloat()
+        var n = 0
+        for (c in trackCels(track)) {
+            if (c.gen != -1) break
+            if (centerFrame < start + c.len / 2f) return n
+            start += c.len
+            n++
+        }
+        return n
+    }
+
+    /**
+     * Raw: moves drawing [celId] into row [toTrack] as its [toIndex]-th drawing. Its strokes follow onto the target row's
+     * layers (same name, else same position, else the first one). A row that loses its only drawing keeps a blank hold of
+     * the same length. Returns the new index in [toTrack], -1 when nothing moved.
+     */
+    fun moveCelToTrack(celId: Int, toTrack: Int, toIndex: Int): Int {
+        val gIdx = cels.indexOfFirst { it.id == celId }
+        if (gIdx < 0) return -1
+        val c = cels[gIdx]
+        val from = c.track
+        if (c.gen != -1 || from == toTrack) return -1
+        val src = drawTracks.firstOrNull { it.id == from } ?: return -1
+        val dst = drawTracks.firstOrNull { it.id == toTrack } ?: return -1
+        if (src.locked || dst.locked) return -1
+        val map = HashMap<Int, Int>()
+        src.layers.forEachIndexed { k, l ->
+            map[l.id] = (dst.layers.firstOrNull { it.name == l.name } ?: dst.layers.getOrNull(k) ?: dst.layers.firstOrNull())?.id ?: l.id
+        }
+        cels.removeAt(gIdx)
+        if (trackCels(from).isEmpty()) cels.add(gIdx, Cel(newCelId(), c.len, from))
+        for (i in strokes.indices) {
+            val s = strokes[i]
+            if (s.cel == celId) strokes[i] = s.copy(layer = map[s.layer] ?: s.layer)
+        }
+        val at = toIndex.coerceIn(0, trackCels(toTrack).count { it.gen == -1 })
+        insertCel(toTrack, at, c.copy(track = toTrack))
+        return at
+    }
+
+    /**
+     * One step of a carried drawing (raw, call on every finger move): inside its own row it reorders one slot at a time,
+     * over another unlocked row it drops in at the finger. The playhead and the active row follow it.
+     * Returns true when something moved.
+     */
+    fun carryCel(celId: Int, toTrack: Int, centerFrame: Float): Boolean {
+        val c = cels.firstOrNull { it.id == celId } ?: return false
+        if (c.gen != -1 || toTrack < 0) return false
+        if (c.track == toTrack) {
+            val from = trackCels(toTrack).indexOfFirst { it.id == celId }
+            val real = trackCels(toTrack).count { it.gen == -1 }
+            val to = reorderTarget(from, centerFrame, toTrack).coerceAtMost(real - 1)
+            if (from < 0 || to == from) return false
+            moveCel(from, to, toTrack)
+            return true
+        }
+        val i = moveCelToTrack(celId, toTrack, dropIndex(toTrack, centerFrame))
+        if (i < 0) return false
+        activeTrack = toTrack
+        frame = celStart(i, toTrack)
+        return true
+    }
+
     fun changeHold(delta: Int) = edit {
+        if (currentIsGenerated) return@edit
         val i = celIndexAt(frame)
         if (i < 0) return@edit
         setLen(i, trackCels()[i].len + delta)
@@ -1190,7 +2170,7 @@ class EditorState {
         val onTrack = tl.clips.filter { it.track == trackId }
         val overlaps = onTrack.any { playheadMs < it.startMs + it.lenMs && playheadMs + c.lenMs > it.startMs }
         val start = if (overlaps) onTrack.maxOf { it.startMs + it.lenMs } else playheadMs
-        val n = c.copy(id = tl.nextClipId(), track = trackId, startMs = start)
+        val n = c.copy(id = tl.nextClipId(), track = trackId, startMs = start, gen = false)
         tl.clips.add(n)
         tl.selectedClip = n.id
     }
@@ -1260,6 +2240,7 @@ class EditorState {
         var au = tl.tracks.filter { it.id in selAudio && !it.locked }.map { it.id }
         if (au.size >= tl.tracks.size) au = au.dropLast(1)
         for (id in au) tl.removeTrack(id)
+        pruneGroups()
         clearTrackSel()
         seek(frame)
     }
@@ -1268,8 +2249,8 @@ class EditorState {
         val i = drawTracks.indexOfFirst { it.id == src.id }
         val id = newTrackId()
         val (ls, map) = remapLayers(src.layers)
-        drawTracks.add(i + 1, DrawTrack(id, "${src.name} copy", offset = src.offset, xf = src.xf, keys = src.keys, rig = src.rig, attach = src.attach, layers = ls))
-        for (c in trackCels(src.id)) {
+        drawTracks.add(i + 1, DrawTrack(id, "${src.name} copy", offset = src.offset, xf = src.xf, keys = src.keys, rig = src.rig, attach = src.attach, layers = ls, group = src.group))
+        for (c in trackCels(src.id).filter { it.gen == -1 }) {
             val nid = newCelId()
             cels.add(Cel(nid, c.len, id))
             strokes.addAll(strokesOf(c.id).map { it.copy(cel = nid, layer = map[it.layer] ?: it.layer) })
@@ -1299,7 +2280,7 @@ class EditorState {
     }
 
     fun copySelectedTracks() {
-        val d = drawTracks.filter { it.id in selDraw }.map { t -> TrackArt(t, trackCels(t.id).map { c -> c.len to strokesOf(c.id) }) }
+        val d = drawTracks.filter { it.id in selDraw }.map { t -> TrackArt(t, trackCels(t.id).filter { it.gen == -1 }.map { c -> c.len to strokesOf(c.id) }) }
         val a = timeline.tracks.filter { it.id in selAudio }.map { t -> AudioArt(t, timeline.clips.filter { it.track == t.id }) }
         if (d.isEmpty() && a.isEmpty()) return
         putClipboard(Clipboard.Tracks(d, a))
@@ -1312,12 +2293,14 @@ class EditorState {
         val c = clipboard as? Clipboard.Tracks ?: return@edit
         val tl = timeline
         val nd = ArrayList<Int>()
+        // pasted rows land above the active one, so they join its group (keeps the group one block)
+        val anchorGroup = joinGroup()
         for (art in c.draw) {
             val id = newTrackId()
-            val at = drawTracks.indexOfFirst { it.id == activeTrack }.let { if (it < 0) drawTracks.size else it + 1 }
+            val at = joinSlot(anchorGroup)
             val t = art.track
             val (ls, map) = remapLayers(t.layers)
-            drawTracks.add(at, DrawTrack(id, "${t.name} copy", offset = t.offset, xf = t.xf, keys = t.keys, rig = t.rig, attach = t.attach, layers = ls))
+            drawTracks.add(at, DrawTrack(id, "${t.name} copy", offset = t.offset, xf = t.xf, keys = t.keys, rig = t.rig, attach = t.attach, layers = ls, group = anchorGroup))
             for ((len, st) in art.cels) {
                 val nid = newCelId()
                 cels.add(Cel(nid, len, id))
@@ -1370,11 +2353,21 @@ fun EditorScreen(
     modifier: Modifier = Modifier,
     state: EditorState = rememberEditorState(),
     surface: @Composable (PaddingValues) -> Unit = { EditorSurface(state, it) },
+    /** Extra content at the start of the top bar (back button, save status). */
+    topLeading: @Composable RowScope.() -> Unit = {},
 ) {
     val density = LocalDensity.current
     var dockH by remember { mutableStateOf(0.dp) }
     val topH = 44.dp
-
+    
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch { state.importImage(ctx, uri) }
+    }
+    LaunchedEffect(state.imagePickRequested) {
+        if (state.imagePickRequested) { state.imagePickRequested = false; imagePicker.launch(arrayOf("image/*")) }
+    }
     LaunchedEffect(state.playing, state.fps) {
         if (!state.playing) return@LaunchedEffect
         if (state.timeline.clips.isEmpty()) {
@@ -1405,7 +2398,7 @@ fun EditorScreen(
     Box(modifier.fillMaxSize()) {
         surface(PaddingValues(top = topH, bottom = dockH))
 
-        TopBar(state, Modifier.align(Alignment.TopCenter).height(topH))
+        TopBar(state, Modifier.align(Alignment.TopCenter).height(topH), topLeading)
 
         Box(
             Modifier
@@ -1431,7 +2424,7 @@ fun EditorScreen(
 }
 
 @Composable
-private fun TopBar(state: EditorState, modifier: Modifier) {
+private fun TopBar(state: EditorState, modifier: Modifier, leading: @Composable RowScope.() -> Unit) {
     val cs = MaterialTheme.colorScheme
     Row(
         modifier
@@ -1439,6 +2432,7 @@ private fun TopBar(state: EditorState, modifier: Modifier) {
             .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        leading()
         Surface(
             shape = CircleShape,
             color = cs.surfaceContainer.copy(alpha = UI_ALPHA),
@@ -1529,6 +2523,9 @@ fun EditorSurface(state: EditorState, pad: PaddingValues) {
         snapshotFlow { state.shownKey() }.distinctUntilChanged().collect { state.syncShown() }
     }
     LaunchedEffect(state) {
+        snapshotFlow { state.fxKey() }.distinctUntilChanged().collect { state.syncFx() }
+    }
+    LaunchedEffect(state) {
         snapshotFlow { state.xfKey() }.distinctUntilChanged().collect { state.syncXf() }
     }
     // bones / curves / keys / mesh / paint -> native (canvas deforms live, exporter gets the same data); rest view while building
@@ -1545,7 +2542,8 @@ fun EditorSurface(state: EditorState, pad: PaddingValues) {
             private var strokeCel = -1
             private var strokeTrack = 0
             private var strokeXf = LayerXf()
-            override fun canDraw() = state.tool == Tool.Brush && state.brush.ready && state.canDrawHere && !state.transformOpen
+            override fun canDraw() = state.tool == Tool.Brush && state.brush.ready && state.canDrawHere && !state.transformOpen && state.placing == null
+            
             override fun onInkStart(p: Offset) {
                 val cel = state.currentCel ?: return
                 strokeCel = cel.id
@@ -1589,6 +2587,7 @@ fun EditorSurface(state: EditorState, pad: PaddingValues) {
         Box(Modifier.fillMaxSize().systemGestureExclusion().canvasGestures(vp, listener))
         // move / rotate / resize handles; sits above the gesture layer, so it takes the touches while open
         if (state.transformOpen) TransformOverlay(state, viewSize)
+        if (state.placing != null) ImagePlaceOverlay(state, viewSize)
         // bones / deform curves: build, pose and weight-paint gestures
         if (state.rigOpen) RigOverlay(state, viewSize)
     }
@@ -1622,6 +2621,7 @@ private fun DrawScope.checker(tile: Float, a: Color, b: Color) {
 }
 
 private fun DrawScope.ink(st: InkStroke, w: Float) {
+    st.image?.let { drawPlacedImage(it, w); return }
     val pts = st.pts
     if (pts.isEmpty()) return
     val k = w / 512f
@@ -1642,11 +2642,17 @@ private fun DrawScope.ink(st: InkStroke, w: Float) {
  * (BlendMode.Clear) only cut through their own layer, and undo/redo stay plain list ops.
  */
 internal fun DrawScope.paintCel(state: EditorState, cel: Int, w: Float, live: InkStroke? = null) {
-    val bounds = Rect(0f, 0f, size.width, size.height)
     val row = state.cels.firstOrNull { it.id == cel }?.track
-    for (l in (if (row != null) state.layersOf(row) else emptyList())) {
+    // PERF: this cel's strokes only, not a scan of every stroke in the project
+    paintLayers(if (row != null) state.layersOf(row) else emptyList(), state.strokesByCel[cel] ?: emptyList(), w, live)
+}
+
+/** [paintCel] on plain data (no snapshot state), so a timeline thumbnail can be inked on a background thread. */
+internal fun DrawScope.paintLayers(layers: List<Layer>, ofCel: List<InkStroke>, w: Float, live: InkStroke? = null) {
+    val bounds = Rect(0f, 0f, size.width, size.height)
+    for (l in layers) {
         if (!l.visible) continue
-        val mine = state.strokes.filter { it.cel == cel && it.layer == l.id }
+        val mine = ofCel.filter { it.layer == l.id }
         val liveHere = live?.takeIf { it.layer == l.id }
         if (mine.isEmpty() && liveHere == null) continue
         drawIntoCanvas { c ->
@@ -1664,13 +2670,13 @@ internal fun DrawScope.paintFrame(state: EditorState, f: Int, w: Float) {
 }
 
 @Composable
-internal fun ToolBtn(kind: Ico, label: String, selected: Boolean, onClick: () -> Unit) {
+internal fun ToolBtn(kind: Ico, label: String, selected: Boolean, size: Dp = 40.dp, onClick: () -> Unit) {
     val cs = MaterialTheme.colorScheme
     val bg by animateColorAsState(if (selected) cs.primaryContainer else Color.Transparent, label = "toolBg")
     val fg = if (selected) cs.onPrimaryContainer else cs.onSurfaceVariant
     Box(
         Modifier
-            .size(40.dp)
+            .size(size)
             .clip(RoundedCornerShape(14.dp))
             .background(bg)
             .clickable(onClick = onClick)
@@ -1680,14 +2686,14 @@ internal fun ToolBtn(kind: Ico, label: String, selected: Boolean, onClick: () ->
 }
 
 @Composable
-internal fun ColorSizeBtn(state: EditorState) {
+internal fun ColorSizeBtn(state: EditorState, size: Dp = 40.dp) {
     val cs = MaterialTheme.colorScheme
     val sel = state.panel == Panel.Color
     val bg by animateColorAsState(if (sel) cs.primaryContainer else Color.Transparent, label = "csBg")
     val dot by animateDpAsState((6 + state.brushSize / 64f * 22f).dp, label = "dot")
     Box(
         Modifier
-            .size(40.dp)
+            .size(size)
             .clip(RoundedCornerShape(14.dp))
             .background(bg)
             .clickable { state.panel = if (sel) Panel.None else Panel.Color }
@@ -1808,6 +2814,75 @@ private fun LabeledSlider(label: String, value: Float, range: ClosedFloatingPoin
     }
 }
 
+/** The menu a row (timeline header icon) or a layer (3-dot) opens: Edit Track, Blend, Clipping (arrow shows while it is on). */
+@Composable
+internal fun FxMenuItems(state: EditorState, target: FxTarget, track: Int, onDismiss: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val clip = state.fxClipOf(target)
+    val mode = state.fxModeOf(target)
+    val op = state.fxOpacityOf(target)
+    if (target !is FxTarget.Grp) DropdownMenuItem(
+        text = { Text("Edit Track") },
+        leadingIcon = { FoxIcon(Ico.Props, iconSize = 20.dp) },
+        onClick = { onDismiss(); state.openTrackMenu(track) },
+    )
+    DropdownMenuItem(
+        text = { Text("Blend") },
+        leadingIcon = { FoxIcon(Ico.Blend, tint = if (mode != 0 || op < 0.999f) cs.primary else LocalContentColor.current, iconSize = 20.dp) },
+        trailingIcon = if (mode != 0 || op < 0.999f) ({ Text(FxBlend.name(mode), style = MaterialTheme.typography.labelSmall, color = cs.primary) }) else null,
+        onClick = { onDismiss(); state.fxTarget = target },
+    )
+    DropdownMenuItem(
+        text = { Text("Clipping") },
+        leadingIcon = { FoxIcon(Ico.ClipArrow, tint = if (clip) cs.primary else LocalContentColor.current, iconSize = 20.dp) },
+        trailingIcon = if (clip) ({ FoxIcon(Ico.ClipArrow, tint = cs.primary, iconSize = 16.dp) }) else null,
+        onClick = { onDismiss(); state.toggleClip(target) },
+    )
+}
+
+/** Blend mode list + opacity slider for a row or a layer. The slider drag is one undo step; a mode tap is one. */
+@Composable
+internal fun FxDialog(state: EditorState, target: FxTarget) {
+    val cs = MaterialTheme.colorScheme
+    var before by remember(target) { mutableStateOf<EditSnap?>(null) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = { state.fxTarget = null },
+        title = { Text("Blend \u00B7 ${state.fxNameOf(target)}") },
+        text = {
+            Column {
+                Text(
+                    "Opacity ${(state.fxOpacityOf(target) * 100f).roundToInt()}%",
+                    style = MaterialTheme.typography.labelMedium, color = cs.onSurfaceVariant,
+                )
+                Slider(
+                    value = state.fxOpacityOf(target),
+                    onValueChange = { v ->
+                        if (before == null) before = state.snapshot()
+                        state.setFxRaw(target, opacity = v)
+                    },
+                    onValueChangeFinished = { before?.let { state.commitEdit(it) }; before = null },
+                    valueRange = 0f..1f,
+                )
+                LazyColumn(Modifier.heightIn(max = 260.dp)) {
+                    items(FxBlend.names.size) { i ->
+                        val on = state.fxModeOf(target) == i
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (on) cs.primaryContainer else Color.Transparent)
+                                .clickable { state.edit { state.setFxRaw(target, blend = i) } }
+                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                        ) { Text(FxBlend.names[i], color = if (on) cs.onPrimaryContainer else cs.onSurface) }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { state.fxTarget = null }) { Text("Done") } },
+        dismissButton = { TextButton(onClick = { state.edit { state.setFxRaw(target, blend = 0, opacity = 1f) } }) { Text("Reset") } },
+    )
+}
+
 @Composable
 internal fun LayersPanel(state: EditorState) {
     val cs = MaterialTheme.colorScheme
@@ -1819,12 +2894,24 @@ internal fun LayersPanel(state: EditorState) {
     ) {
         Column(Modifier.width(196.dp).padding(vertical = 6.dp)) {
             Row(Modifier.padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Layers \u00B7 ${state.activeTrackObj?.name ?: ""}", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-                FilledTonalIconButton(onClick = { state.addLayer() }, modifier = Modifier.size(36.dp)) {
-                    FoxIcon(Ico.Plus, iconSize = 18.dp)
+                var menu by remember { mutableStateOf(false) }
+                Box {
+                    FilledTonalIconButton(onClick = { menu = true }, modifier = Modifier.size(36.dp)) {
+                        FoxIcon(Ico.Plus, iconSize = 18.dp)
+                    }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Add layer") },
+                            leadingIcon = { FoxIcon(Ico.Layers, iconSize = 20.dp) },
+                            onClick = { menu = false; state.addLayer() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Import image") },
+                            leadingIcon = { FoxIcon(Ico.Image, iconSize = 20.dp) },
+                            enabled = state.canImportImage,
+                            onClick = { menu = false; state.panel = Panel.None; state.imagePickRequested = true },
+                        )
+                    }
                 }
             }
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp)) {
@@ -1863,12 +2950,23 @@ internal fun LayersPanel(state: EditorState) {
                                 iconSize = 20.dp,
                             )
                         }
+                        if (l.clip) FoxIcon(Ico.ClipArrow, Modifier.padding(start = 4.dp), tint = cs.primary, iconSize = 14.dp)   // clipped to the layer below
                         Text(
                             l.name,
-                            Modifier.padding(start = 6.dp),
+                            Modifier.padding(start = 6.dp).weight(1f),
                             style = MaterialTheme.typography.bodyMedium,
                             color = if (sel) cs.onPrimaryContainer else cs.onSurface,
                         )
+                        var fxMenu by remember { mutableStateOf(false) }
+                        Box {
+                            Box(
+                                Modifier.size(30.dp).clip(CircleShape).clickable { fxMenu = true },
+                                contentAlignment = Alignment.Center,
+                            ) { FoxIcon(Ico.More, tint = if (sel) cs.onPrimaryContainer else cs.onSurfaceVariant, iconSize = 18.dp) }
+                            DropdownMenu(expanded = fxMenu, onDismissRequest = { fxMenu = false }) {
+                                FxMenuItems(state, FxTarget.Lay(l.id), state.drawTracks.firstOrNull { t -> t.layers.any { it.id == l.id } }?.id ?: state.activeTrack) { fxMenu = false }
+                            }
+                        }
                     }
                 }
             }
@@ -1880,6 +2978,8 @@ internal fun LayersPanel(state: EditorState) {
 private fun Dock(state: EditorState, modifier: Modifier) {
     val cs = MaterialTheme.colorScheme
     var menuOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(state.editMenuTick) { if (state.editMenuTick > 0) menuOpen = true }   // "Edit Track" in a row / layer menu
+    state.fxTarget?.let { FxDialog(state, it) }
     Surface(
         modifier,
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
@@ -1894,8 +2994,11 @@ private fun Dock(state: EditorState, modifier: Modifier) {
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically(),
         ) { TransformPanel(state) }
+        
+        AnimatedVisibility(state.placing != null, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) { ImagePlacePanel(state) }
+        
         AnimatedVisibility(
-            !state.transformOpen,
+            !state.transformOpen && state.placing == null,
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically(),
         ) {
@@ -1981,6 +3084,16 @@ private fun EditorMenu(state: EditorState, open: Boolean, onDismiss: () -> Unit)
         Item("Import Audio\u2026", !tl.loading) { state.audioPickRequested = true }
 
         HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        Section("GROUPS")
+        Item("Group Active Drawing Layer") { state.groupActiveTrack() }
+        Item("Group Selected Tracks", state.selCount > 0) { state.groupSelectedTracks() }
+        Item("Ungroup Selected Tracks", state.selectionInGroup) { state.ungroupSelectedTracks() }
+        Item("Rename Active Drawing Layer") { state.renameTarget = RenameTarget.Draw(state.activeTrack) }
+        for (m in RETIME_MODES) {
+            Item("Re-timing: ${retimeName(m)}", state.selectedGroup >= 0) { state.setGroupFill(state.selectedGroup, m) }
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
         Section("EDITING")
         Item("Copy") { state.copySelection() }
         Item("Cut", canEdit) { state.cutSelection() }
@@ -2042,9 +3155,23 @@ private fun PropRow(label: String, value: Float, range: ClosedFloatingPointRange
 }
 
 enum class Ico {
-    Brush, Deform, Bone, Layers, Chevron, Undo, Redo, ToStart, ToEnd, Prev, Next,
+    Brush, Deform, Bone, Warp, Layers, Chevron, Undo, Redo, ToStart, ToEnd, Prev, Next,
     Play, Pause, Props, Plus, Eye, EyeOff, Eraser, Smudge, Blur,
-    Lock, Unlock, Volume, VolumeOff, Music, Export, More, Transform,
+    Lock, Unlock, Volume, VolumeOff, Music, Export, More, Transform, Image, Blend, ClipArrow,
+}
+
+/** Everything the exporter needs for blend modes + clipping (see NativeExporter.nativeSetFx). */
+class ExportFx(
+    val rowMode: IntArray, val rowOpacity: FloatArray, val rowClip: BooleanArray,
+    val layerIds: IntArray, val layerMode: IntArray, val layerOpacity: FloatArray, val layerClip: BooleanArray,
+    /** Group folders: group id of every row (-1 = none), then per group its id / blend / opacity / clip. */
+    val rowGroup: IntArray, val groupIds: IntArray, val groupMode: IntArray, val groupOpacity: FloatArray, val groupClip: BooleanArray,
+) {
+    fun applyTo(handle: Long) {
+        val n = fox.foxiru.foxcat.fox2d.jnicallers.NativeExporter
+        n.nativeSetFx(handle, rowMode, rowOpacity, rowClip, layerIds, layerMode, layerOpacity, layerClip)
+        n.nativeSetGroupFx(handle, rowGroup, groupIds, groupMode, groupOpacity, groupClip)
+    }
 }
 
 @Composable
@@ -2075,6 +3202,11 @@ fun FoxIcon(
                 drawLine(tint, o(9f, 15f), o(18f, 6f), 4f * s, StrokeCap.Round)
                 drawCircle(tint, 3.2f * s, o(6.5f, 17.5f))
             }
+            Ico.Image -> {
+                drawRoundRect(tint, o(4f, 5f), Size(16f * s, 14f * s), CornerRadius(2.5f * s), style = line)
+                drawCircle(tint, 1.8f * s, o(9f, 10f))
+                drawPath(Path().apply { m(5f, 18f); l(10f, 13f); l(13.5f, 16.5f); l(16f, 14f); l(19f, 17.5f) }, tint, style = thin)
+            }
             Ico.Deform -> {
                 for (y in listOf(6f, 12f, 18f)) {
                     drawPath(Path().apply { m(3f, y); q(8f, y - 4f, 12f, y); q(16f, y + 4f, 21f, y) }, tint, style = thin)
@@ -2093,6 +3225,17 @@ fun FoxIcon(
                 drawLine(tint, o(8.2f, 15.8f), o(15.8f, 8.2f), 2f * s, StrokeCap.Round)
                 drawCircle(tint, 3f * s, o(6f, 18f), style = line)
                 drawCircle(tint, 3f * s, o(18f, 6f), style = line)
+            }
+            Ico.Warp -> {
+                // push-pin (Puppet Warp pins): outlined head + flange, needle toward the lower left
+                drawPath(
+                    Path().apply {
+                        m(15.1f, 3.6f); l(14.3f, 6.0f); l(10.4f, 9.4f); l(7.2f, 10.6f); l(13.7f, 17.2f)
+                        l(15.2f, 13.6f); l(17.8f, 9.7f); l(20.3f, 8.7f); close()
+                    },
+                    tint, style = line,
+                )
+                drawLine(tint, o(9.6f, 14.4f), o(4f, 20f), 2f * s, StrokeCap.Round)
             }
             Ico.Layers -> {
                 drawPath(Path().apply { m(12f, 3f); l(21f, 7.5f); l(12f, 12f); l(3f, 7.5f); close() }, tint, style = line)
@@ -2177,6 +3320,14 @@ fun FoxIcon(
                 drawPath(Path().apply { m(5f, 13f); l(5f, 19f); l(19f, 19f); l(19f, 13f) }, tint, style = line)
             }
             Ico.More -> for (x in listOf(5f, 12f, 19f)) drawCircle(tint, 2.1f * s, o(x, 12f))
+            Ico.Blend -> {
+                drawCircle(tint, 6.2f * s, o(9.2f, 12f), style = line)
+                drawCircle(tint, 6.2f * s, o(14.8f, 12f), style = line)
+            }
+            Ico.ClipArrow -> {
+                drawPath(Path().apply { m(6f, 4f); l(6f, 16f); l(18f, 16f) }, tint, style = line)
+                drawPath(Path().apply { m(14f, 12f); l(18f, 16f); l(14f, 20f) }, tint, style = line)
+            }
             Ico.Eye, Ico.EyeOff -> {
                 drawPath(
                     Path().apply { m(3f, 12f); c(6f, 6f, 18f, 6f, 21f, 12f); c(18f, 18f, 6f, 18f, 3f, 12f) },

@@ -73,9 +73,12 @@ object MovieExporter {
     ): ExportResult = coroutineScope {
         val app = context.applicationContext
         val strokes = state.strokes.toList()
-        val cels = state.cels.toList()
+        // rows of re-timed groups (Loop / Freeze / Stretch ...) are unrolled for the exporter only; everything else passes through
+        val timeline = buildExportTimeline(state)
+        val cels = timeline.cels
         val layers = state.drawTracks.flatMap { it.layers }   // ids are unique across rows
-        val rows = state.drawTracks.toList() // bottom -> top, same order the canvas composites
+        val rows = timeline.rows // bottom -> top, same order the canvas composites
+        val groups = state.groups.toList()
         val srcFps = state.fps
 
         val side = (options.side.coerceIn(64, 4096) / 2) * 2
@@ -92,12 +95,20 @@ object MovieExporter {
             val meta = IntArray(strokes.size * 5)
             val sizes = FloatArray(strokes.size)
             var ptCount = 0
-            for (s in strokes) ptCount += s.pts.size * 2
+            for (s in strokes) ptCount += if (s.image != null) 6 else s.pts.size * 2
             val pts = FloatArray(ptCount)
             var o = 0
             for ((i, s) in strokes.withIndex()) {
                 meta[i * 5] = s.cel
                 meta[i * 5 + 1] = s.layer
+                val im = s.image
+                if (im != null) {
+                    meta[i * 5 + 2] = 0; meta[i * 5 + 3] = 2; meta[i * 5 + 4] = 3   // 3 "points" = 6 floats
+                    sizes[i] = 0f
+                    pts[o++] = im.cx; pts[o++] = im.cy; pts[o++] = im.w; pts[o++] = im.h; pts[o++] = im.rot
+                    pts[o++] = ImageStore.handleOf(im.file).toFloat()
+                    continue
+                }
                 meta[i * 5 + 2] = s.color.toArgb()
                 meta[i * 5 + 3] = if (s.erase) 1 else 0
                 meta[i * 5 + 4] = s.pts.size
@@ -123,6 +134,16 @@ object MovieExporter {
                 meta, sizes, pts,
             )
             if (h == 0L) return@coroutineScope ExportResult.Failed("Invalid export data")
+
+            // Blend modes / opacity / clipping masks: rows bottom -> top, layers by id. Built from the same snapshot as above.
+            ExportFx(
+                IntArray(rows.size) { rows[it].blend }, FloatArray(rows.size) { rows[it].opacity }, BooleanArray(rows.size) { rows[it].clip },
+                IntArray(layers.size) { layers[it].id }, IntArray(layers.size) { layers[it].blend },
+                FloatArray(layers.size) { layers[it].opacity }, BooleanArray(layers.size) { layers[it].clip },
+                IntArray(rows.size) { i -> rows[i].group.takeIf { g -> groups.any { it.id == g } } ?: -1 },
+                IntArray(groups.size) { groups[it].id }, IntArray(groups.size) { groups[it].blend },
+                FloatArray(groups.size) { groups[it].opacity }, BooleanArray(groups.size) { groups[it].clip },
+            ).applyTo(h)
 
             try {
                 val finished = AtomicBoolean(false)

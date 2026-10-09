@@ -31,6 +31,25 @@ object NativeExporter {
         strokePts: FloatArray,
     ): Long
 
+    /**
+     * More strokes for the job (same layout as the nativeCreate arrays). Send them in small batches after nativeCreate and
+     * before nativeRun, so the Java heap never holds one array with every point of the project.
+     */
+    @JvmStatic external fun nativeAddStrokes(handle: Long, strokeMeta: IntArray, strokeSize: FloatArray, strokePts: FloatArray): Boolean
+
+    /** Blend / opacity / clipping of the rows (bottom -> top) and layers (by layer id). Call after nativeCreate, before nativeRun. */
+    @JvmStatic external fun nativeSetFx(
+        handle: Long,
+        rowMode: IntArray, rowOpacity: FloatArray, rowClip: BooleanArray,
+        layerIds: IntArray, layerMode: IntArray, layerOpacity: FloatArray, layerClip: BooleanArray,
+    )
+
+    /** Blend / opacity / clipping of group folders. rowGroup = group id of every row (bottom -> top, -1 = none). */
+    @JvmStatic external fun nativeSetGroupFx(
+        handle: Long,
+        rowGroup: IntArray, groupIds: IntArray, groupMode: IntArray, groupOpacity: FloatArray, groupClip: BooleanArray,
+    )
+
     @JvmStatic external fun nativeRun(handle: Long): Int
     @JvmStatic external fun nativeProgress(handle: Long): Float
     @JvmStatic external fun nativeCancel(handle: Long)

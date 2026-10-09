@@ -3,6 +3,7 @@ package fox.foxiru.foxcat.fox2d
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -22,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -29,8 +31,9 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import dagger.hilt.android.AndroidEntryPoint
+import fox.foxiru.foxcat.fox2d.gallery.GalleryScreen
+import fox.foxiru.foxcat.fox2d.gallery.ProjectEditor
 import fox.foxiru.foxcat.fox2d.ui.theme.ComposeEmptyActivityTheme
-import fox.foxiru.foxcat.fox2d.main_canvas.EditorScreen
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -56,16 +59,35 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 }
-                MainApp()
+                AppRoot()
             }
         }
     }
 }
 
+/** Gallery  ->  editor of one project;  gallery menu  ->  the old test tabs. Survives rotation / process death. */
 @Composable
-fun MainApp() {
-    var tab by rememberSaveable { mutableIntStateOf(3) }
-    val tabs = listOf("Testing", "Settings", "Panels", "Editor")
+fun AppRoot() {
+    var openId by rememberSaveable { mutableStateOf<String?>(null) }
+    var devTools by rememberSaveable { mutableStateOf(false) }
+    val id = openId
+    when {
+        devTools -> {
+            BackHandler { devTools = false }
+            DevTabs()
+        }
+        id != null -> ProjectEditor(id, onClose = { openId = null })
+        else -> Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+            GalleryScreen(onOpen = { openId = it }, onDevTools = { devTools = true })
+        }
+    }
+}
+
+/** The former tab screen minus the editor (the editor now opens from the gallery). */
+@Composable
+fun DevTabs() {
+    var tab by rememberSaveable { mutableIntStateOf(0) }
+    val tabs = listOf("Testing", "Settings", "Panels")
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -91,7 +113,6 @@ fun MainApp() {
             }
 
             when (tab) {
-                // Index 0: FFmpeg + Oboe test area (scrolls as a normal page)
                 0 -> TestingScreen(
                     modifier = Modifier
                         .fillMaxSize()
@@ -99,7 +120,6 @@ fun MainApp() {
                         .padding(16.dp)
                 )
 
-                // Scrolls as a normal page (titles, expanding items, disabled item)
                 1 -> FoxiruDemo(
                     modifier = Modifier
                         .fillMaxSize()
@@ -107,14 +127,11 @@ fun MainApp() {
                         .padding(16.dp)
                 )
 
-                // Bounded height so the group's own scroll works (sticky top bar + list)
                 2 -> FoxiruPanelDemo(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(16.dp)
                 )
-
-                3 -> EditorScreen(modifier = Modifier.fillMaxSize())
             }
         }
     }
