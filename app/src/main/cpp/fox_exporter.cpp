@@ -35,6 +35,7 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 
+#include "FoxBrushEngine.h"
 #include "fox_imagelayer.h"
 #include "fox_blend.h"
 
@@ -69,7 +70,10 @@ struct StrokeData {
     bool erase = false;
     std::vector<float> pts;
     bool isImg = false;
-    
+    // Custom brush stroke (meta mode 3 = paint, 4 = erase): replayed through fox::brush so the video matches the canvas.
+    bool isBrush = false;
+    std::vector<float> brush;   // fox::brush::P params (kParamCount floats, incl. P_SEED)
+    std::vector<float> smp;     // x y pressure ms per sample, paper-normalised 0..1
 };
 
 struct Job {
@@ -376,6 +380,7 @@ struct Renderer {
     
     GLuint imgProg = 0;
     std::unordered_map<int, GLuint> imgTex;
+    fox::brush::Renderer brushR;   // GPU dab renderer shared with the on-screen canvas
 
     ~Renderer() { shutdown(); }
 
@@ -492,6 +497,8 @@ struct Renderer {
         cache.push_back(CachedLayer{-1, -1, layerTex, layerFbo, 0});
         cacheMax = (size_t) std::clamp<int64_t>((int64_t) 96 * 1024 * 1024 / ((int64_t) S * S * 4), 1, 16);
 
+        if (!brushR.init(S)) LOGE("brush engine init failed: custom brushes will be skipped");
+
         fxc.init(vaoEmpty);   // a failure only turns blend / clipping off (fxc.ok), the export itself still works
         fxc.resize(S, S);
 
@@ -515,6 +522,7 @@ struct Renderer {
             if (imgProg) glDeleteProgram(imgProg);
             imgProg = 0;
             
+            brushR.shutdown();
             fxc.release();
             if (outFbo) glDeleteFramebuffers(1, &outFbo);
             if (outTex) glDeleteTextures(1, &outTex);
@@ -594,8 +602,26 @@ struct Renderer {
         fox::img::draw(imgProg, tex, s.pts[0], s.pts[1], s.pts[2], s.pts[3], s.pts[4], vaoEmpty);
     }
 
+    // Custom brush: same Builder + dab shader as the canvas, fed the stored samples, so the pixels are identical.
+    void drawBrushStroke(const StrokeData& s) {
+        flush();   // plain strokes queued before this one must land first (draw order)
+        if (!brushR.ready() || s.smp.size() < 4) return;
+        fox::brush::Params P;
+        if (!fox::brush::Params::fromArray(s.brush.data(), (int) s.brush.size(), P)) return;
+        fox::brush::Builder b;
+        b.begin(P, s.argb, (float) S / kBrushSpace);   // pxPerUnit = paper px / 512, exactly like the canvas
+        for (size_t i = 0; i + 3 < s.smp.size(); i += 4) b.add(fox::brush::Sample{s.smp[i], s.smp[i + 1], s.smp[i + 2], s.smp[i + 3]});
+        std::vector<fox::brush::Dab> dabs;
+        b.emit(dabs, true);
+        if (!dabs.empty()) brushR.draw(layerFbo, P, s.argb, s.erase, dabs.data(), dabs.size());
+        brushR.endStroke(layerFbo);   // clears the opacity-cap scratch / backup
+        glBindFramebuffer(GL_FRAMEBUFFER, layerFbo);
+        glViewport(0, 0, S, S);
+    }
+
     void drawStroke(const StrokeData& s) {
         if (s.isImg) { flush(); drawImage(s); return; }
+        if (s.isBrush) { drawBrushStroke(s); return; }
         if (erase != s.erase) { flush(); erase = s.erase; }
         const size_t n = s.pts.size() / 2;
         if (n == 0) return;
@@ -1227,13 +1253,27 @@ static bool appendStrokes(JNIEnv* env, Job& job, jintArray strokeMeta, jfloatArr
         s.cel = meta[(size_t) i * 5];
         s.layer = meta[(size_t) i * 5 + 1];
         s.argb = (uint32_t) meta[(size_t) i * 5 + 2];
-        s.erase = meta[(size_t) i * 5 + 3] == 1;
-        s.isImg = meta[(size_t) i * 5 + 3] == 2;
+        const int mode = meta[(size_t) i * 5 + 3];   // 0 plain, 1 plain erase, 2 image, 3 brush, 4 brush erase
+        s.erase = mode == 1 || mode == 4;
+        s.isImg = mode == 2;
+        s.isBrush = mode == 3 || mode == 4;
         const size_t cnt = (size_t) std::max(0, meta[(size_t) i * 5 + 4]) * 2;
         if (off + cnt > pts.size()) return false;
         s.size = sizes[(size_t) i];
         s.pts.assign(pts.begin() + (ptrdiff_t) off, pts.begin() + (ptrdiff_t) (off + cnt));
         off += cnt;
+        if (s.isBrush) {
+            // pts = [nParams, params..., zero pad to a multiple of 4, (x y p t) * nSamples]
+            const size_t total = s.pts.size();
+            const size_t nPar = total ? (size_t) std::max(0.f, s.pts[0]) : 0;
+            const size_t hdr = (1 + nPar + 3) & ~(size_t) 3;
+            if (nPar == 0 || nPar > 256 || hdr > total) continue;   // malformed: drop this stroke only
+            s.brush.assign(s.pts.begin() + 1, s.pts.begin() + (ptrdiff_t) (1 + nPar));
+            s.smp.assign(s.pts.begin() + (ptrdiff_t) hdr, s.pts.end());
+            s.smp.resize(s.smp.size() & ~(size_t) 3);
+            s.pts.clear();
+            s.pts.shrink_to_fit();
+        }
         job.strokes.push_back(std::move(s));
     }
     return true;

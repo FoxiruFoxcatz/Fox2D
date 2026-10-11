@@ -9,6 +9,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import fox.foxiru.foxcat.fox2d.jnicallers.BrushExportPacking
 import fox.foxiru.foxcat.fox2d.jnicallers.NativeExporter
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +60,22 @@ sealed interface ExportResult {
 object MovieExporter {
     const val SUBDIR = "Fox2D"
 
+    // Brush engine strokes keep their parameter array (incl. seed) and (pressure, ms) per point in InkStroke.engine.
+    // Classic capsule-pen strokes have engine == null and keep going through the plain path.
+    private fun brushParamsOf(s: InkStroke): FloatArray? = s.engine?.params
+
+    /** x, y (InkStroke.pts, layer space, the same values the canvas fed to NativeCanvas.strokePoint), pressure, ms. */
+    private fun brushSamplesOf(s: InkStroke): FloatArray {
+        val e = s.engine ?: return FloatArray(0)
+        val n = minOf(s.pts.size, e.aux.size / 2)
+        val out = FloatArray(n * 4)
+        for (i in 0 until n) {
+            out[i * 4] = s.pts[i].x; out[i * 4 + 1] = s.pts[i].y
+            out[i * 4 + 2] = e.aux[i * 2]; out[i * 4 + 3] = e.aux[i * 2 + 1]
+        }
+        return out
+    }
+
     fun availableEncoders(): Set<String> =
         NativeExporter.nativeEncoders().split(',').filter { it.isNotBlank() }.toSet()
 
@@ -95,7 +112,14 @@ object MovieExporter {
             val meta = IntArray(strokes.size * 5)
             val sizes = FloatArray(strokes.size)
             var ptCount = 0
-            for (s in strokes) ptCount += if (s.image != null) 6 else s.pts.size * 2
+            for (s in strokes) {
+                val bp = brushParamsOf(s)
+                ptCount += when {
+                    s.image != null -> 6
+                    bp != null -> BrushExportPacking.brushFloatCount(bp.size, brushSamplesOf(s).size / 4)
+                    else -> s.pts.size * 2
+                }
+            }
             val pts = FloatArray(ptCount)
             var o = 0
             for ((i, s) in strokes.withIndex()) {
@@ -107,6 +131,22 @@ object MovieExporter {
                     sizes[i] = 0f
                     pts[o++] = im.cx; pts[o++] = im.cy; pts[o++] = im.w; pts[o++] = im.h; pts[o++] = im.rot
                     pts[o++] = ImageStore.handleOf(im.file).toFloat()
+                    continue
+                }
+                val bp = brushParamsOf(s)
+                if (bp != null) {
+                    // custom brush: params + stored samples, replayed by the native brush engine (modes 3 / 4)
+                    val smp = brushSamplesOf(s)
+                    meta[i * 5 + 2] = s.color.toArgb()
+                    meta[i * 5 + 3] = if (s.erase) 4 else 3
+                    val total = BrushExportPacking.brushFloatCount(bp.size, smp.size / 4)
+                    meta[i * 5 + 4] = total / 2
+                    sizes[i] = s.size
+                    val start = o
+                    pts[o++] = bp.size.toFloat()
+                    for (v in bp) pts[o++] = v
+                    o = start + ((1 + bp.size + 3) and 3.inv())   // zero pad (array is zero-initialised)
+                    for (k in 0 until (smp.size / 4) * 4) pts[o++] = smp[k]
                     continue
                 }
                 meta[i * 5 + 2] = s.color.toArgb()
