@@ -205,7 +205,7 @@ internal fun RigOverlay(state: EditorState, viewSize: IntSize) {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val tr = state.activeTrack
                     val tool = state.tool
-                    val md = state.rigUi.mode.let { if ((tool == Tool.Deform || tool == Tool.Warp) && it == RigMode.Paint) RigMode.Build else it }
+                    val md = state.rigUi.mode.let { if (it == RigMode.Paint && (tool == Tool.Deform || tool == Tool.Warp || state.trackRig(tr).method == RigMethod.Transform)) RigMode.Build else it }
                     val locked = state.activeLocked
                     val rig0 = state.trackRig(tr)
                     val xf0 = state.trackXf(tr)

@@ -1,11 +1,28 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.ComposeEmptyActivity" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">@color/splash_background</item>
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.ComposeEmptyActivity"
+        parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">
+            @drawable/splash_background_drawable
+        </item>
     </style>
 
-    <style name="Theme.Fox2D.Splash" parent="Theme.SplashScreen">
-        <item name="windowSplashScreenBackground">@color/splash_background</item>
-        <item name="postSplashScreenTheme">@style/Theme.ComposeEmptyActivity</item>
-        <!-- optional: <item name="windowSplashScreenAnimatedIcon">@drawable/your_icon</item> -->
+    <style name="Theme.Fox2D.Splash"
+        parent="Theme.SplashScreen">
+
+        <item name="windowSplashScreenBackground">
+            @color/splash_background
+        </item>
+
+        <item name="windowSplashScreenAnimatedIcon">
+            @drawable/ic_launcher_foreground
+        </item>
+
+        <item name="postSplashScreenTheme">
+            @style/Theme.ComposeEmptyActivity
+        </item>
+
     </style>
+
 </resources>

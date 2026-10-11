@@ -240,6 +240,26 @@ void main() {
 }
 )";
 
+// Cut-out rows (fox_rig.h outlineShown): the outline triangles, aPos = shown position, aUV = rest texel. Same row transform as kMeshVSMain.
+const char* kCutVS = R"(#version 300 es
+precision highp float;
+uniform vec2 uPivot, uTr, uSc;
+uniform float uRot;
+uniform mat2 uAM;
+uniform vec2 uAT;
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aUV;
+out vec2 vUV;
+void main() {
+    vUV = aUV;
+    vec2 d = (aPos - uPivot) * uSc;
+    float cs = cos(uRot), sn = sin(uRot);
+    vec2 p = uPivot + uTr + vec2(cs * d.x - sn * d.y, sn * d.x + cs * d.y);
+    p = uAM * p + uAT;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
 const char* kQuadFS = R"(#version 300 es
 precision highp float;
 in vec2 vUV;
@@ -339,6 +359,8 @@ struct Renderer {
     int posTexW = 0;
     std::vector<float> posTmpE;
     GLint mTex = -1, mPivot = -1, mTr = -1, mSc = -1, mRot = -1, mAM = -1, mAT = -1;
+    GLuint cutProg = 0, vaoCut = 0, vboCut = 0, iboCut = 0;   // cut-out path
+    GLint cTex = -1, cPivot = -1, cTr = -1, cSc = -1, cRot = -1, cAM = -1, cAT = -1;
     GLuint layerTex = 0, layerFbo = 0, outTex = 0, outFbo = 0;
     fox::blend::Ctx fxc;   // intermediate pictures for blend modes + clipping masks
 
@@ -407,7 +429,15 @@ struct Renderer {
         meshProg = link(meshVS.c_str(), kQuadFS);
         
         imgProg = link(fox::img::kImageVS, fox::img::kImageFS);
-        if (!strokeProg || !quadProg || !meshProg || !imgProg) { err = "shader build failed"; return false; }
+        cutProg = link(kCutVS, kQuadFS);
+        if (!strokeProg || !quadProg || !meshProg || !cutProg || !imgProg) { err = "shader build failed"; return false; }
+        cTex = glGetUniformLocation(cutProg, "uTex");
+        cPivot = glGetUniformLocation(cutProg, "uPivot");
+        cTr = glGetUniformLocation(cutProg, "uTr");
+        cSc = glGetUniformLocation(cutProg, "uSc");
+        cRot = glGetUniformLocation(cutProg, "uRot");
+        cAM = glGetUniformLocation(cutProg, "uAM");
+        cAT = glGetUniformLocation(cutProg, "uAT");
         mTex = glGetUniformLocation(meshProg, "uTex");
         mPivot = glGetUniformLocation(meshProg, "uPivot");
         mTr = glGetUniformLocation(meshProg, "uTr");
@@ -439,6 +469,15 @@ struct Renderer {
         glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) 0);
         glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) (2 * sizeof(float)));
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboMesh);
+        glBindVertexArray(0);
+        glGenVertexArrays(1, &vaoCut);
+        glGenBuffers(1, &vboCut);
+        glGenBuffers(1, &iboCut);
+        glBindVertexArray(vaoCut);
+        glBindBuffer(GL_ARRAY_BUFFER, vboCut);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) 0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) (2 * sizeof(float)));
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboCut);
         glBindVertexArray(0);
         glBindVertexArray(vaoStroke);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -487,6 +526,11 @@ struct Renderer {
             if (vaoMesh) glDeleteVertexArrays(1, &vaoMesh);
             if (meshProg) glDeleteProgram(meshProg);
             vboMesh = iboMesh = vaoMesh = meshProg = 0;
+            if (vboCut) glDeleteBuffers(1, &vboCut);
+            if (iboCut) glDeleteBuffers(1, &iboCut);
+            if (vaoCut) glDeleteVertexArrays(1, &vaoCut);
+            if (cutProg) glDeleteProgram(cutProg);
+            vboCut = iboCut = vaoCut = cutProg = 0;
             if (vaoStroke) glDeleteVertexArrays(1, &vaoStroke);
             if (vaoEmpty) glDeleteVertexArrays(1, &vaoEmpty);
             if (strokeProg) glDeleteProgram(strokeProg);
@@ -577,7 +621,7 @@ struct Renderer {
     // [rigs] / [rverts]: rows with a valid rig are drawn as the deformed mesh in rverts[row] (x y u v per vertex).
     void renderFrame(const Job& j, const std::vector<int>& active, const std::vector<fox::anim::Xf>& xfs,
                      const std::vector<fox::rig::Rig>& rigs, const std::vector<std::vector<float>>& rverts,
-                     const std::vector<fox::rig::Aff>& atts, std::vector<uint8_t>& rgba) {
+                     const std::vector<std::vector<float>>& rcut, const std::vector<fox::rig::Aff>& atts, std::vector<uint8_t>& rgba) {
         const bool useFx = j.fxUsed && fxc.ok;
         glBindFramebuffer(GL_FRAMEBUFFER, outFbo);
         glViewport(0, 0, S, S);
@@ -593,6 +637,8 @@ struct Renderer {
             const std::vector<size_t>* idx = nullptr;
             bool meshRow = false;
             bool meshUploaded = false;
+            bool cutRow = false;         // cut-out: outline triangles (rcut) instead of the grid surface
+            bool cutUploaded = false;
             std::vector<size_t> items;   // indices into j.layerIds
         };
         std::vector<RowWork> work(active.size());
@@ -605,6 +651,7 @@ struct Renderer {
             w.idx = &it->second;
             w.am = ri < atts.size() ? atts[ri] : fox::rig::Aff{};
             w.meshRow = ri < rigs.size() && rigs[ri].valid && ri < rverts.size() && !rverts[ri].empty();
+            w.cutRow = w.meshRow && ri < rcut.size() && !rcut[ri].empty();
             for (size_t li = 0; li < j.layerIds.size(); li++) {
                 if (!j.layerVis[li]) continue;
                 const int lid = j.layerIds[li];
@@ -643,7 +690,28 @@ struct Renderer {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
             glEnable(GL_BLEND);
             glBlendFunc(atop ? GL_DST_ALPHA : GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            if (w.meshRow) {
+            if (w.cutRow) {
+                glUseProgram(cutProg);
+                glUniform1i(cTex, 0);
+                glUniform2f(cPivot, xf.px, xf.py);
+                glUniform2f(cTr, xf.tx, xf.ty);
+                glUniform2f(cSc, xf.sx, xf.sy);
+                glUniform1f(cRot, xf.rot * 3.14159265358979f / 180.f);
+                glUniformMatrix2fv(cAM, 1, GL_FALSE, amv);
+                glUniform2f(cAT, w.am.tx, w.am.ty);
+                glBindVertexArray(vaoCut);
+                if (!w.cutUploaded) {   // once per row and frame, shared by all its layers
+                    const std::vector<int>& tri = rigs[ri].geo.tri;
+                    std::vector<uint32_t> idx(tri.begin(), tri.end());
+                    glBindBuffer(GL_ARRAY_BUFFER, vboCut);
+                    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr) (rcut[ri].size() * sizeof(float)), rcut[ri].data(), GL_DYNAMIC_DRAW);
+                    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, iboCut);
+                    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr) (idx.size() * sizeof(uint32_t)), idx.data(), GL_DYNAMIC_DRAW);
+                    w.cutUploaded = true;
+                }
+                glDrawElements(GL_TRIANGLES, (GLsizei) rigs[ri].geo.tri.size(), GL_UNSIGNED_INT, nullptr);
+                glBindVertexArray(0);
+            } else if (w.meshRow) {
                 glUseProgram(meshProg);
                 glUniform1i(mTex, 0);
                 glUniform2f(mPivot, xf.px, xf.py);
@@ -1005,7 +1073,7 @@ int execute(Job& j) {
     std::vector<uint8_t> rgba((size_t) j.side * j.side * 4);
     std::vector<int> active(rows.size(), -1), lastActive;
     std::vector<fox::anim::Xf> xfs(rows.size()), lastXfs(rows.size());
-    std::vector<std::vector<float>> chvs(rows.size()), lastChvs(rows.size()), rverts(rows.size());
+    std::vector<std::vector<float>> chvs(rows.size()), lastChvs(rows.size()), rverts(rows.size()), rcut(rows.size());
     std::vector<fox::rig::Pose> poses(rows.size());
     std::vector<fox::rig::Aff> atts(rows.size()), lastAtts(rows.size());
     std::vector<int> attPar(rows.size(), -1), attBone(rows.size(), -1);
@@ -1047,12 +1115,24 @@ int execute(Job& j) {
         const bool sameRig = haveFrame && chvs == lastChvs;
         if (!haveFrame || active != lastActive || !sameXfs || !sameRig || !sameAtt) {   // re-render only when a row switched drawing, moved or deformed
             for (size_t ri = 0; ri < rows.size() && ri < rigs.size(); ri++) {
-                if (rigs[ri].valid && active[ri] >= 0) fox::rig::buildMesh(rigs[ri], chvs[ri].data(), rverts[ri], poses[ri]);
-                else rverts[ri].clear();
+                rcut[ri].clear();
+                if (rigs[ri].valid && active[ri] >= 0) {
+                    fox::rig::buildMesh(rigs[ri], chvs[ri].data(), rverts[ri], poses[ri]);
+                    // CUT-OUT rows (same code as the live canvas, fox_canvas.cpp uploadCut): x y u v per outline vertex
+                    std::vector<float> pos;
+                    const fox::rig::Rig& G = rigs[ri];
+                    if (G.cutOut && G.geo.ok() && !G.geo.tri.empty() && !G.pins.empty() && fox::rig::outlineShown(G, chvs[ri].data(), pos) && pos.size() == G.geo.v.size() * 2) {
+                        rcut[ri].resize(G.geo.v.size() * 4);
+                        for (size_t k = 0; k < G.geo.v.size(); k++) {
+                            rcut[ri][k * 4] = pos[k * 2]; rcut[ri][k * 4 + 1] = pos[k * 2 + 1];
+                            rcut[ri][k * 4 + 2] = G.geo.v[k].x; rcut[ri][k * 4 + 3] = G.geo.v[k].y;
+                        }
+                    }
+                } else rverts[ri].clear();
             }
             lastChvs = chvs;
             lastAtts = atts;
-            rd.renderFrame(j, active, xfs, rigs, rverts, atts, rgba);
+            rd.renderFrame(j, active, xfs, rigs, rverts, rcut, atts, rgba);
             r = av_frame_make_writable(x.vf);
             if (r < 0) return fail(j, -7, "frame buffer: " + averr(r));
             rgbaToYuv(rgba.data(), j.side, x.vf, nv12);

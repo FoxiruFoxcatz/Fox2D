@@ -50,7 +50,7 @@ class RigUiState {
     /** Puppet Warp "Fit to image": which pixels of the picked picture form the outline ([FitShape.id]) and whether it keeps its aspect. */
     var fitShape by mutableIntStateOf(0)
     var fitUniform by mutableStateOf(false)
-    /** Outline-following triangle meshes by drawing-track id (see RigFit.kt). Session only: not saved with the project yet. */
+    /** Per-row mirror of Rig.outline by drawing-track id (see RigFit.kt). The rig is what is saved; applyProject rebuilds this from it. */
     val tri = HashMap<Int, TriMeshData>()
     /** 0 = coarse, 1 = medium, 2 = fine. */
     var triDensity by mutableIntStateOf(1)
@@ -103,6 +103,11 @@ fun EditorState.selectRigTool(t: Tool) {
 /** Keeps the bone / curve / point selection inside the active row's rig (row switch, undo, delete). */
 fun EditorState.normalizeRigSel() {
     val r = trackRig()
+    if (r.method == RigMethod.Transform) {
+        // Transform method = positions + rotations only: no weight painting, no stretch gesture
+        if (rigUi.mode == RigMode.Paint && tool == Tool.Bone) rigUi.mode = RigMode.Build
+        if (rigUi.poseTool == PoseTool.Scale) rigUi.poseTool = PoseTool.Auto
+    }
     if (rigUi.bone !in r.bones.indices) rigUi.bone = if (r.bones.isEmpty()) -1 else 0
     if (rigUi.curve !in r.curves.indices) { rigUi.curve = if (r.curves.isEmpty()) -1 else 0; rigUi.ctl = -1 }
     else if (rigUi.ctl !in r.curves[rigUi.curve].pts.indices) rigUi.ctl = -1
@@ -568,19 +573,23 @@ fun EditorState.resetPins(track: Int, only: Int = -1) = edit {
 }
 
 /** Add a pin at layer point [p]; makes sure the mesh exists (fits to the drawing the first time). One undo step. */
-fun EditorState.addWarpPin(track: Int, p: Offset) = edit {
-    val r = trackRig(track)
-    if (r.pins.size >= RigLimits.MAX_PINS) return@edit
-    if (r.bones.isEmpty() && r.curves.isEmpty() && r.pins.isEmpty()) {
-        val b = trackBounds(track)
-        val m = 0.06f
-        val rect = if (b == null) MeshRect() else MeshRect(
-            (b.left - m).coerceAtLeast(0f), (b.top - m).coerceAtLeast(0f), (b.right + m).coerceAtMost(1f), (b.bottom + m).coerceAtMost(1f),
-        )
-        setRig(track) { it.withMesh(it.grid, rect) }
+fun EditorState.addWarpPin(track: Int, p: Offset) {
+    // pins weigh by distance along the drawing, which needs its outline mesh: build it (silently) the first time
+    if (trackRig(track).outline == null && trackRig(track).pins.size < RigLimits.MAX_PINS) generateOutlineMesh(track, show = false)
+    edit {
+        val r = trackRig(track)
+        if (r.pins.size >= RigLimits.MAX_PINS) return@edit
+        if (r.bones.isEmpty() && r.curves.isEmpty() && r.pins.isEmpty()) {
+            val b = trackBounds(track)
+            val m = 0.06f
+            val rect = if (b == null) MeshRect() else MeshRect(
+                (b.left - m).coerceAtLeast(0f), (b.top - m).coerceAtLeast(0f), (b.right + m).coerceAtMost(1f), (b.bottom + m).coerceAtMost(1f),
+            )
+            setRig(track) { it.withMesh(it.grid, rect) }
+        }
+        setRig(track) { it.addPin(p.x, p.y) }
+        rigUi.pin = trackRig(track).pins.size - 1
     }
-    setRig(track) { it.addPin(p.x, p.y) }
-    rigUi.pin = trackRig(track).pins.size - 1
 }
 
 fun EditorState.removeWarpPin(track: Int, i: Int) = edit {
@@ -595,7 +604,19 @@ fun EditorState.clearWarpPins(track: Int) = edit {
     rigUi.pin = -1
 }
 
+/** Bone method of the row: Transform (parts moved / turned by bones) or Mesh (skinned picture). One undo step. */
+fun EditorState.setRigMethod(track: Int, m: RigMethod) {
+    edit { setRig(track) { it.withMethod(m) } }
+    normalizeRigSel()
+}
+
 fun EditorState.setWarpFalloff(track: Int, f: Int) = edit { setRig(track) { it.withWarpFalloff(f) } }
+
+/** Puppet Warp solver: 1 = ARAP (needs the outline mesh), 0 = rigid MLS. */
+fun EditorState.setWarpSolver(track: Int, s: Int) = edit { setRig(track) { it.withWarpSolver(s) } }
+
+/** Puppet Warp cut-out: draw the picture as the outline-mesh triangles (no grid smear). Off = the old grid surface. */
+fun EditorState.setWarpCutOut(track: Int, on: Boolean) = edit { setRig(track) { it.withCutOut(on) } }
 
 /** Snap for a dragged HEAD of bone [b]: the nearest tail of an earlier bone within [r] (layer units). Returns (tail point, that bone). */
 fun Rig.snapHead(b: Int, p: Offset, r: Float): Pair<Offset, Int>? {

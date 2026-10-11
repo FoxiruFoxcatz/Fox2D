@@ -48,6 +48,7 @@ add_library(${LIB_NAME} SHARED
     fox_exporter.cpp
     fox_loopgen.cpp
     fox_project.cpp
+    FoxBrushEngine.cpp
 )
 
 target_include_directories(${LIB_NAME} PRIVATE

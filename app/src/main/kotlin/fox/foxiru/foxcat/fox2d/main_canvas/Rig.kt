@@ -141,8 +141,18 @@ class WeightPaint(val verts: Int, val bones: Int, val data: FloatArray, val vers
     }
 }
 
+/** Marks the outline-mesh tail of a row blob; must equal fox::rig::kOutlineMagic. */
+private const val OUTLINE_MAGIC = 7331f
+
 @Immutable
 data class MeshRect(val l: Float = 0f, val t: Float = 0f, val r: Float = 1f, val b: Float = 1f)
+
+/**
+ * How the bones of a row act. [Transform] (default) = rigid parts: a bone only MOVES and TURNS (position + rotation) the layers attached
+ * to it, the row's own picture is not skinned. [Mesh] = the classic skinning: the picture bends around the bones by weights
+ * (influence radius / falloff / strength, painted weights, mesh grid, stretch channels).
+ */
+enum class RigMethod(val label: String) { Transform("Transform"), Mesh("Mesh") }
 
 /** Everything the rig of one drawing row consists of. Keys: sorted by (channel, row-local frame), channel numbers from [RigChan]. */
 @Immutable
@@ -156,6 +166,18 @@ data class Rig(
     val pins: List<Pin> = emptyList(),
     /** Puppet-warp reach: 1 = wide, 2 = medium, 3 = tight (MLS weight exponent). */
     val warpFalloff: Int = 2,
+    /** Outline mesh of the drawing (layer paper units). Rides in the row blob so pins weigh by distance ALONG the drawing (fox_rig.h GeoField). */
+    val outline: TriMeshData? = null,
+    /** Puppet-warp solver: 1 = ARAP on the outline mesh (fox_arap.h), 0 = rigid MLS. ARAP needs the outline mesh; without one the row uses MLS. */
+    val warpSolver: Int = 1,
+    /**
+     * Puppet-warp CUT-OUT: the picture is cut along the outline mesh and every triangle is drawn with its own rest-pose texels at its
+     * solved position (fox_rig.h outlineShown / fox_canvas.cpp uploadCut). Nothing around the drawing is warped, so the original raster
+     * (paper margin, grid box, row origin) can no longer smear into the shape. Needs the outline mesh too; without one the grid is used.
+     */
+    val cutOut: Boolean = true,
+    /** Bone method of this row (see [RigMethod]). Must be saved with the project; files from before it existed should load as [RigMethod.Mesh]. */
+    val method: RigMethod = RigMethod.Transform,
 ) {
     val isEmpty: Boolean get() = bones.isEmpty() && curves.isEmpty() && pins.isEmpty()
     val vertCount: Int get() = (grid + 1) * (grid + 1)
@@ -168,10 +190,12 @@ data class Rig(
         val p = paint?.takeIf { it.verts == vertCount && it.bones == bones.size }
         val sorted = keys.sortedWith(ChanKeyOrder)
         val ctlCount = curves.sumOf { it.pts.size }
+        val ol = outline?.takeIf { pins.isNotEmpty() && it.vertexCount in 3..4000 && it.triangleCount in 1..8000 }
         val a = FloatArray(
             RigLimits.ROW_HEAD + bones.size * RigLimits.BONE_STRIDE + curves.size * RigLimits.CURVE_HEAD +
                 ctlCount * RigLimits.CTL_STRIDE +
-                (if (pins.isEmpty()) 0 else RigLimits.PIN_HEAD + pins.size * RigLimits.PIN_STRIDE) + sorted.size * KEY_STRIDE + (p?.data?.size ?: 0)
+                (if (pins.isEmpty()) 0 else RigLimits.PIN_HEAD + pins.size * RigLimits.PIN_STRIDE) + sorted.size * KEY_STRIDE + (p?.data?.size ?: 0) +
+                (if (ol == null) 0 else 3 + ol.verts.size + ol.tris.size)
         )
         a[0] = bones.size.toFloat(); a[1] = curves.size.toFloat(); a[2] = grid.toFloat()
         a[3] = rect.l; a[4] = rect.t; a[5] = rect.r; a[6] = rect.b
@@ -180,7 +204,8 @@ data class Rig(
         var o = RigLimits.ROW_HEAD
         for (b in bones) {
             a[o] = b.parent.toFloat(); a[o + 1] = b.hx; a[o + 2] = b.hy; a[o + 3] = b.angle; a[o + 4] = b.len
-            a[o + 5] = b.radius; a[o + 6] = b.falloff; a[o + 7] = b.strength
+            a[o + 5] = b.radius; a[o + 6] = b.falloff
+            a[o + 7] = if (method == RigMethod.Transform) 0f else b.strength   // Transform: no skin influence, the bone only drives attached layers
             for (c in 0 until 8) a[o + 8 + c] = b.base[c]
             a[o + 16] = b.ikChain.toFloat(); a[o + 17] = b.ikBend
             o += RigLimits.BONE_STRIDE
@@ -194,12 +219,18 @@ data class Rig(
             }
         }
         if (pins.isNotEmpty()) {
-            a[o] = warpFalloff.coerceIn(1, 3).toFloat(); a[o + 1] = 0f
+            // pin head slot 1 (fox_rig.h parseRow): bit 0 = ARAP solver, bit 1 = cut-out
+            a[o] = warpFalloff.coerceIn(1, 3).toFloat(); a[o + 1] = ((if (warpSolver == 1) 1 else 0) or (if (cutOut) 2 else 0)).toFloat()
             o += RigLimits.PIN_HEAD
             for (t in pins) { a[o] = t.rx; a[o + 1] = t.ry; a[o + 2] = t.dx; a[o + 3] = t.dy; a[o + 4] = t.rot; a[o + 5] = t.stiff; o += RigLimits.PIN_STRIDE }
         }
         for (k in sorted) { k.writeTo(a, o); o += KEY_STRIDE }
-        if (p != null) { p.data.copyInto(a, o) }
+        if (p != null) { p.data.copyInto(a, o); o += p.data.size }
+        if (ol != null) {   // optional tail (fox_rig.h kOutlineMagic): magic, nV, nT, x y per vertex, i j k per triangle
+            a[o] = OUTLINE_MAGIC; a[o + 1] = ol.vertexCount.toFloat(); a[o + 2] = ol.triangleCount.toFloat(); o += 3
+            ol.verts.copyInto(a, o); o += ol.verts.size
+            ol.tris.copyInto(a, o)
+        }
         return a
     }
 
@@ -450,6 +481,12 @@ data class Rig(
         if (i !in pins.indices) this else copy(pins = pins.toMutableList().also { it[i] = it[i].copy(stiff = v.coerceIn(0.2f, 4f)) })
 
     fun withWarpFalloff(f: Int): Rig = copy(warpFalloff = f.coerceIn(1, 3))
+
+    fun withWarpSolver(s: Int): Rig = copy(warpSolver = if (s == 1) 1 else 0)
+
+    fun withCutOut(on: Boolean): Rig = copy(cutOut = on)
+
+    fun withMethod(m: RigMethod): Rig = if (m == method) this else copy(method = m)
 
     // ------------------------------------------------------------------ mesh + weights
 

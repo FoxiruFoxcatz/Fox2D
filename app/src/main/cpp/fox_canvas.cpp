@@ -42,11 +42,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <unordered_set>
+#include <functional>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -56,14 +58,21 @@
 #include "fox_blend.h"
 #include "fox_anim.h"
 #include "fox_rig.h"
+#include "fox_celcache.h"
 #include "fox_fit.h"
 #include "fox_mesh.h"
+#include "FoxBrushEngine.h"
+#include "fox_onion.h"
 
 #define TAG "FoxCanvas"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // Per-call-site error probe: reports the first few errors of THIS site only, so one noisy site cannot hide the others.
+#ifdef FOX_GL_DEBUG
 #define GLC(label) do { static int b_ = 4; GLenum e_; while ((e_ = glGetError()) != GL_NO_ERROR) { if (b_-- > 0) LOGE("GL error 0x%x at %s", (unsigned) e_, label); } } while (0)
+#else
+#define GLC(label) do { } while (0)
+#endif
 
 
 namespace {
@@ -92,14 +101,16 @@ struct Stroke {
     float size = 10.f;
     bool erase = false;
     std::vector<float> pts;   // xy pairs, paper-normalised
-    size_t emitted = 0;       // segments already rasterised (live stroke only)
+    size_t emitted = 0;       // segments already rasterised (live stroke only); engine strokes: points already fed to the Builder
+    std::vector<float> prm;   // Brush Studio parameter array (layout = enum P in FoxBrushEngine.h); empty = classic capsule pen
+    std::vector<float> aux;   // engine strokes only: (pressure, ms) per point of [pts]
     
     bool isImg = false;
     int img = -1;
     float ix = 0, iy = 0, iw = 0, ih = 0, irot = 0;
 };
 
-enum class Op { Begin, Point, End, Cancel, Undo, Redo, SetShown, SetLayers, SetFx, SetGroupFx, SetXf, AddStroke, ResetStrokes, SetAnim, SetTime, SetRig, SetAttach, AddImage, FreeImage };
+enum class Op { Begin, Point, End, Cancel, Undo, Redo, SetShown, SetLayers, SetFx, SetGroupFx, SetXf, AddStroke, ResetStrokes, SetAnim, SetTime, SetRig, SetAttach, AddImage, FreeImage, Prefetch, SetOnion };
 
 struct Cmd {
     Op op{};
@@ -110,7 +121,15 @@ struct Cmd {
     std::vector<float> pts;
     std::vector<int> ids;
     std::vector<uint8_t> vis;
+    float f2 = 0, f3 = 0;                 // Op::Point on an engine stroke: pressure, ms
+    std::vector<float> prm, aux;          // Op::Begin / Op::AddStroke on an engine stroke
 };
+
+// Brush engine (FoxBrushEngine.cpp). GL thread only. A stroke with a non-empty Stroke::prm is drawn as dabs by the engine
+// instead of Catmull-Rom capsules; it replays deterministically (the seed lives in prm), so undo / cel switches match live ink.
+static fox::brush::Renderer gEng;
+static bool gEngOk = false;
+static std::unique_ptr<fox::brush::Builder> gBld;   // the live engine stroke's dab generator (null while the classic pen is active)
 
 struct ViewState {
     float scale = 1.f, rot = 0.f;
@@ -138,6 +157,10 @@ struct PubRig {
     int grid = 0;
     float l = 0.f, t = 0.f, r = 1.f, b = 1.f;   // rest rect of the mesh (paper units)
     std::vector<float> verts;   // x y u v per vertex (fox::rig::buildMesh)
+    // CUT-OUT rows: the picture is the outline triangles, so a touch is inverted through THEM (unwarpCut), not through the grid
+    bool cutOn = false;
+    std::vector<float> cut;     // x y u v per outline vertex (shown position, rest texel)
+    std::vector<int> cutTri;    // i j k per triangle
 };
 std::vector<PubRig> gPub;                 // guarded by gMu
 std::vector<fox::rig::Aff> gPubAtt;       // guarded by gMu: per-row attachment matrix (paper units) as drawn
@@ -149,6 +172,46 @@ struct TriData { std::vector<float> v; std::vector<int> t; };
 std::unordered_map<int, TriData> gTri;
 uint32_t gTriVer = 1;
 std::atomic<bool> gRigPosed{true};        // false: rigged rows are shown in their REST pose (rig editing)
+
+// Cut-out inverse (touch -> picture). [cut] = x y u v per outline vertex (shown position, rest texel), [tri] = i j k per triangle.
+// Inside a drawn triangle: its exact affine inverse (later triangles win, like the draw order). Beside the drawing no triangle covers the
+// point: the NEAREST triangle's map is continued, so a stroke that starts next to the shape joins it without a jump. Farther than
+// [reach] paper units from every triangle the point is not mapped (false): nothing is drawn there anyway.
+inline bool unwarpCut(const std::vector<float>& cut, const std::vector<int>& tri, float x, float y, float& u, float& v, float reach = 0.15f) {
+    const size_t nv = cut.size() / 4, nt = tri.size() / 3;
+    if (nv < 3 || nt < 1) return false;
+    int best = -1;
+    double bestD2 = (double) reach * (double) reach, bl[3] = {0, 0, 0}, bc[3] = {0, 0, 0};
+    for (size_t k = nt; k-- > 0;) {
+        const int ia = tri[k * 3], ib = tri[k * 3 + 1], ic = tri[k * 3 + 2];
+        if (ia < 0 || ib < 0 || ic < 0 || (size_t) ia >= nv || (size_t) ib >= nv || (size_t) ic >= nv) continue;
+        const float *A = &cut[(size_t) ia * 4], *B = &cut[(size_t) ib * 4], *C = &cut[(size_t) ic * 4];
+        const double den = (double) (B[1] - C[1]) * (A[0] - C[0]) + (double) (C[0] - B[0]) * (A[1] - C[1]);
+        if (std::fabs(den) < 1e-14) continue;   // folded flat
+        const double l1 = ((double) (B[1] - C[1]) * (x - C[0]) + (double) (C[0] - B[0]) * (y - C[1])) / den;
+        const double l2 = ((double) (C[1] - A[1]) * (x - C[0]) + (double) (A[0] - C[0]) * (y - C[1])) / den;
+        const double l3 = 1.0 - l1 - l2;
+        if (l1 >= -1e-5 && l2 >= -1e-5 && l3 >= -1e-5) {
+            u = (float) (l1 * A[2] + l2 * B[2] + l3 * C[2]);
+            v = (float) (l1 * A[3] + l2 * B[3] + l3 * C[3]);
+            return std::isfinite(u) && std::isfinite(v);
+        }
+        if (std::min({A[0], B[0], C[0]}) - reach > x || std::max({A[0], B[0], C[0]}) + reach < x ||
+            std::min({A[1], B[1], C[1]}) - reach > y || std::max({A[1], B[1], C[1]}) + reach < y) continue;
+        double w[3];
+        fox::arap::closestBary(x, y, A[0], A[1], B[0], B[1], C[0], C[1], w);
+        const double sx = w[0] * A[0] + w[1] * B[0] + w[2] * C[0] - x, sy = w[0] * A[1] + w[1] * B[1] + w[2] * C[1] - y;
+        const double d2 = sx * sx + sy * sy;
+        if (d2 < bestD2) { bestD2 = d2; best = (int) k; bl[0] = l1; bl[1] = l2; bl[2] = l3; bc[0] = w[0]; bc[1] = w[1]; bc[2] = w[2]; }
+    }
+    if (best < 0) return false;
+    const float *A = &cut[(size_t) tri[(size_t) best * 3] * 4], *B = &cut[(size_t) tri[(size_t) best * 3 + 1] * 4], *C = &cut[(size_t) tri[(size_t) best * 3 + 2] * 4];
+    // a sliver blows the extension up: then use the closest point of the triangle itself
+    const double* w = std::max({std::fabs(bl[0]), std::fabs(bl[1]), std::fabs(bl[2])}) > 20.0 ? bc : bl;
+    u = (float) (w[0] * A[2] + w[1] * B[2] + w[2] * C[2]);
+    v = (float) (w[0] * A[3] + w[1] * B[3] + w[2] * C[3]);
+    return std::isfinite(u) && std::isfinite(v);
+}
 
 // ---- CPU mirror of the mesh vertex shader's surface (kSmoothFn): used to invert a touch back to the picture ----
 // Inside the mesh box: bicubic Catmull-Rom through the grid points (exactly what the GPU draws). Outside the box:
@@ -263,6 +326,18 @@ struct LayerGL {
     GLuint tex = 0, fbo = 0;
     LayerXf xf;   // all layers of one timeline row share the same transform (set from Kotlin)
     fox::blend::Fx fx;   // blend mode / opacity / clipping of this layer inside its row
+    int cel = -1;          // drawing whose picture the texture holds (-1 = none)
+    bool dirty = false;    // the texture holds edits the raster cache does not have yet (snapshot before it is replaced)
+    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;   // content box in layer px (empty while bx1 <= bx0): what a snapshot has to read back
+};
+
+// One GPU -> RAM read-back in flight (PBO + fence): the GL thread never stalls on it.
+struct ReadJob {
+    GLuint pbo = 0;
+    GLsync fence = nullptr;
+    uint64_t key = 0, seq = 0;
+    int T = 0, x = 0, y = 0, w = 0, h = 0;
+    bool dead = false;   // history was reset meanwhile: drop the pixels
 };
 
 struct PaperProg {
@@ -289,6 +364,11 @@ struct RigGL {
     GLuint posTex = 0;           // RG32F (grid+1)^2: shown position of every grid vertex (read by the smoothing vertex shader)
     std::vector<float> posTmp;
     bool uploaded = false;
+    // CUT-OUT (fox_rig.h outlineShown): the outline triangles drawn with rest-pose uv. Used instead of the grid when cutOn.
+    GLuint cutVao = 0, cutVbo = 0, cutIbo = 0;
+    GLsizei cutCount = 0;       // indices
+    std::vector<float> cutBuf;  // x y u v per outline vertex
+    bool cutOn = false;
 };
 
 struct TriGL {
@@ -308,7 +388,7 @@ struct GLState {
     bool rebuildAll = false;
     int W = 1, H = 1, T = kPaperDefault;
     GLuint strokeProg = 0; GLint uT = -1;
-    PaperProg paper, layer, mesh, wire, triwire;
+    PaperProg paper, layer, mesh, cut, wire, triwire;
     std::unordered_map<int, TriGL> triGL;   // row -> GPU edge quads of its triangle mesh
     uint32_t triVer = 0;
     std::vector<RigGL> rigs;   // row r <-> rigs[r] (may be shorter than rows)
@@ -323,7 +403,12 @@ struct GLState {
     std::vector<Stroke> history, redo;
     std::optional<Stroke> active;
     std::unordered_set<int> shown;   // cel ids currently on screen (one per timeline row)
+    std::unordered_map<int, std::unordered_map<int, int>> inkBy;   // cel -> (native layer -> strokes in history): O(1) "what does this cel touch"
+    std::vector<ReadJob> reads;
+    uint64_t invSeq = 0;                              // bumped by every change to a (cel, layer)'s strokes
+    std::unordered_map<uint64_t, uint64_t> lastInv;   // (cel, layer) -> invSeq of its last change (rejects read-backs that started before it)
     Emitter emit;
+    fox::onion::Onion onion;   // onion skin ghosts + their two baked pictures (fox_onion.h)
 
     // keyframe animation: row r drives native layers [r * perRow, (r + 1) * perRow)
     std::vector<RowAnim> rows;
@@ -331,6 +416,9 @@ struct GLState {
     float curFrame = 0.f;   // timeline frame (fractional ok)
     bool animDirty = false;
 } g;
+
+fox::onion::BakeProg gBake;   // onion skin baking shader
+LayerGL gOnionScratch;        // one drawing layer at a time is replayed into this before it is baked into a ghost picture
 
 // ------------------------------------------------------------------------------------------ shaders
 
@@ -460,6 +548,25 @@ vec2 smoothVertex(out vec2 rest) {
     float fy = ly == 0 ? -e0.y : (ly == m ? G + e1.y : float(ly - 1) / float(uSub));
     rest = uRect.xy + w * vec2(fx, fy) / G;
     return surfExt(vec2(fx, fy));
+}
+)";
+
+// Cut-out: plain triangles. aPos = shown position (paper units), aUV = rest position = texel. Same varyings as the mesh
+// shader, so the layer fragment shader (clip to paper + texture lookup) is shared.
+const char* kCutVS = R"(#version 300 es
+precision highp float;
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform float uSide;
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aUV;
+out vec2 vLocal;
+out vec2 vShown;
+void main() {
+    vLocal = aUV * uSide;
+    vec4 w = uModel * vec4(aPos * uSide, 0.0, 1.0);
+    vShown = w.xy;
+    gl_Position = uMVP * w;
 }
 )";
 
@@ -702,6 +809,10 @@ glm::vec4 unpackArgb(uint32_t c) {
 // Diagnostics: logs the first few GL errors per site (Logcat tag FoxCanvas). GL never throws, so without this a failed
 // texture allocation / incomplete framebuffer only shows up as a garbled canvas.
 void glChk(const char* where) {
+#ifndef FOX_GL_DEBUG
+    (void) where;
+    return;
+#endif
     static int budget = 40;
     for (int i = 0; i < 4; i++) {
         const GLenum err = glGetError();
@@ -711,6 +822,10 @@ void glChk(const char* where) {
 }
 
 void glChkOp(int op) {
+#ifndef FOX_GL_DEBUG
+    (void) op;
+    return;   // was: snprintf + glGetError for EVERY queued command (every stroke point)
+#endif
     char buf[40];
     snprintf(buf, sizeof buf, "after Op #%d", op);
     glChk(buf);
@@ -735,6 +850,7 @@ void createLayerGL(LayerGL& L) {
     glViewport(0, 0, g.T, g.T);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
+    L.cel = -1; L.dirty = false; L.bx0 = L.by0 = L.bx1 = L.by1 = 0;
     glChk("createLayerGL");
 }
 
@@ -742,6 +858,7 @@ void destroyLayerGL(LayerGL& L) {
     if (L.fbo) glDeleteFramebuffers(1, &L.fbo);
     if (L.tex) glDeleteTextures(1, &L.tex);
     L.fbo = L.tex = 0;
+    L.cel = -1; L.dirty = false; L.bx0 = L.by0 = L.bx1 = L.by1 = 0;
 }
 
 bool isShown(int cel) { return g.shown.count(cel) != 0; }
@@ -768,14 +885,17 @@ void bindLayer(LayerGL& L) {
     GLC("bindLayer: bindFramebuffer");
     glViewport(0, 0, g.T, g.T);
     GLC("bindLayer: viewport");
+#ifdef FOX_GL_DEBUG
     static int fboBudget = 20;
     if (fboBudget > 0) {
         const GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (st != GL_FRAMEBUFFER_COMPLETE) { fboBudget--; LOGE("bindLayer %d (fbo %u tex %u): framebuffer status 0x%x", L.id, L.fbo, L.tex, (unsigned) st); }
     }
+#endif
 }
 
 void clearLayer(LayerGL& L) {
+    L.bx0 = L.by0 = L.bx1 = L.by1 = 0;
     bindLayer(L);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -791,11 +911,14 @@ void pushSeg(std::vector<Vert>& v, glm::vec2 a, glm::vec2 b, float r, const glm:
         return;
     }
     const float m = r + 1.5f;
-    const glm::vec2 lo = glm::min(a, b) - m;
-    const glm::vec2 hi = glm::max(a, b) + m;
+    const glm::vec2 ab = b - a;
+    const float len = glm::length(ab);
+    const glm::vec2 d = len > 1e-4f ? ab / len : glm::vec2(1.f, 0.f);
+    const glm::vec2 nrm(-d.y, d.x);
+    const glm::vec2 a0 = a - d * m, b0 = b + d * m;   // capsule hull: the segment grown by r + AA margin on every side
     const glm::vec2 corner[6] = {
-        {lo.x, lo.y}, {hi.x, lo.y}, {lo.x, hi.y},
-        {hi.x, lo.y}, {hi.x, hi.y}, {lo.x, hi.y},
+        a0 - nrm * m, b0 - nrm * m, a0 + nrm * m,
+        b0 - nrm * m, b0 + nrm * m, a0 + nrm * m,
     };
     Vert vt{glm::vec2(0.f), glm::vec4(a, b), r, c};
     for (const glm::vec2& p : corner) {
@@ -817,6 +940,17 @@ void flush(Emitter& e, LayerGL& L) {
             LOGE("flush: strokeProg=%u isProgram=%d uT=%d currentProgram=%d g@%p", g.strokeProg, (int) glIsProgram(g.strokeProg), (int) g.uT, (int) cur, (void*) &g);
         }
     }
+    {   // bounding box of this batch in layer pixels (vertex pos is paper px == FBO texel coords)
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+        for (const Vert& q : e.v) { x0 = std::min(x0, q.pos.x); y0 = std::min(y0, q.pos.y); x1 = std::max(x1, q.pos.x); y1 = std::max(y1, q.pos.y); }
+        const int sx = std::clamp((int) std::floor(x0) - 1, 0, g.T), sy = std::clamp((int) std::floor(y0) - 1, 0, g.T);
+        const int ex = std::clamp((int) std::ceil(x1) + 1, 0, g.T), ey = std::clamp((int) std::ceil(y1) + 1, 0, g.T);
+        if (ex <= sx || ey <= sy) { e.v.clear(); return; }   // entirely off the paper
+        if (L.bx1 <= L.bx0 || L.by1 <= L.by0) { L.bx0 = sx; L.by0 = sy; L.bx1 = ex; L.by1 = ey; }
+        else { L.bx0 = std::min(L.bx0, sx); L.by0 = std::min(L.by0, sy); L.bx1 = std::max(L.bx1, ex); L.by1 = std::max(L.by1, ey); }
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(sx, sy, ex - sx, ey - sy);
+    }
     glUseProgram(g.strokeProg);
     GLC("flush: useProgram(strokeProg)");
     glUniform1f(g.uT, (float) g.T);
@@ -831,6 +965,7 @@ void flush(Emitter& e, LayerGL& L) {
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr) (e.v.size() * sizeof(Vert)), e.v.data(), GL_STREAM_DRAW);
     GLC("flush: bufferData");
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei) e.v.size());
+    glDisable(GL_SCISSOR_TEST);   // bindLayer turns it off per bind, but the screen pass must never inherit the stroke's rect
     GLC("flush: drawArrays");
     e.v.clear();   // keeps capacity
 }
@@ -862,6 +997,7 @@ void drawImageStroke(const Stroke& s, Emitter& e, LayerGL& L) {
     }
     GLC("drawImageStroke: before draw");
     fox::img::draw(g.imgProg, tex, s.ix, s.iy, s.iw, s.ih, s.irot, 0);
+    L.bx0 = 0; L.by0 = 0; L.bx1 = g.T; L.by1 = g.T;   // an image may cover anything: snapshot the whole layer
     // the image helper owns its own program / blend / texture unit: put the stroke pipeline's assumptions back
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(0);
@@ -873,7 +1009,8 @@ void drawImageStroke(const Stroke& s, Emitter& e, LayerGL& L) {
 // Uniform Catmull-Rom between p1 and p2 (paper px), subdivided to ~3px steps.
 // q(t) = 0.5 * (2 p1 + (p2 - p0) t + (2 p0 - 5 p1 + 4 p2 - p3) t^2 + (3 p1 - p0 - 3 p2 + p3) t^3)
 void emitCR(Emitter& e, glm::vec2 p0, glm::vec2 p1, glm::vec2 p2, glm::vec2 p3, float r, const glm::vec4& c) {
-    const int n = std::clamp((int) std::ceil(glm::distance(p1, p2) / 3.f), 1, 32);
+    const float step = c.a >= 0.999f ? std::clamp(r * 0.35f, 3.f, 48.f) : 3.f;
+    const int n = std::clamp((int) std::ceil(glm::distance(p1, p2) / step), 1, 32);
     const glm::vec2 k1 = -p0 + p2;
     const glm::vec2 k2 = 2.f * p0 - 5.f * p1 + 4.f * p2 - p3;
     const glm::vec2 k3 = -p0 + 3.f * p1 - 3.f * p2 + p3;
@@ -886,13 +1023,53 @@ void emitCR(Emitter& e, glm::vec2 p0, glm::vec2 p1, glm::vec2 p2, glm::vec2 p3, 
     }
 }
 
+// Engine stroke: feed the points not yet seen to the Builder, stamp the dabs it releases. [live] = the running stroke's Builder;
+// null = replay of a whole stroke (a local Builder, same samples -> same dabs).
+void rasterEngine(const Stroke& s, size_t& emitted, bool finish, Emitter& e, LayerGL& L, fox::brush::Builder* live) {
+    const size_t n = s.pts.size() / 2;
+    fox::brush::Params P;
+    fox::brush::Params::fromArray(s.prm.data(), (int) s.prm.size(), P);
+    fox::brush::Builder local;
+    fox::brush::Builder* b = live;
+    if (!b) { b = &local; b->begin(P, s.argb, (float) g.T / kBrushSpace); emitted = 0; }
+    for (; emitted < n; emitted++) {
+        fox::brush::Sample sm;
+        sm.x = s.pts[emitted * 2]; sm.y = s.pts[emitted * 2 + 1];
+        const bool have = s.aux.size() >= (emitted + 1) * 2;
+        sm.p = have ? s.aux[emitted * 2] : 0.5f;
+        sm.t = have ? s.aux[emitted * 2 + 1] : (float) emitted * 8.f;
+        b->add(sm);
+    }
+    std::vector<fox::brush::Dab> dabs;
+    b->emit(dabs, finish);
+    if (dabs.empty() && !finish) return;
+    flush(e, L);   // classic ink queued before this stroke keeps its place under it
+    bindLayer(L);
+    if (!dabs.empty()) {
+        const fox::brush::Rect r = gEng.draw(L.fbo, P, s.argb, s.erase, dabs.data(), dabs.size());
+        if (r.x1 > r.x0 && r.y1 > r.y0) {   // grow the layer's content box (what a snapshot reads back)
+            if (L.bx1 <= L.bx0 || L.by1 <= L.by0) { L.bx0 = r.x0; L.by0 = r.y0; L.bx1 = r.x1; L.by1 = r.y1; }
+            else { L.bx0 = std::min(L.bx0, r.x0); L.by0 = std::min(L.by0, r.y0); L.bx1 = std::max(L.bx1, r.x1); L.by1 = std::max(L.by1, r.y1); }
+        }
+    }
+    if (finish) gEng.endStroke(L.fbo);   // opacity-capped brushes composite their scratch layer here
+    // the engine owns its own program / VAO / blend: put the stroke pipeline's assumptions back (as drawImageStroke does)
+    glActiveTexture(GL_TEXTURE0);
+    glDisable(GL_SCISSOR_TEST);
+    glBindVertexArray(0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 // Rasterise the not-yet-emitted part of a stroke. `finish` also emits the tail segment / a lone dot.
 // Deterministic, so replay after undo/cel switch gives pixel-identical results to live drawing.
-void rasterStroke(const Stroke& s, size_t& emitted, bool finish, Emitter& e, LayerGL& L) {
+// [live] = the running engine stroke's Builder (null for classic strokes and for whole-stroke replays).
+void rasterStroke(const Stroke& s, size_t& emitted, bool finish, Emitter& e, LayerGL& L, int maxSpans = 1 << 30, fox::brush::Builder* live = nullptr) {
     if (s.isImg) {
         if (finish && emitted == 0) { drawImageStroke(s, e, L); emitted = 1; }
         return;
     }
+    if (!s.prm.empty() && gEngOk) { rasterEngine(s, emitted, finish, e, L, live); return; }
     if (e.erase != s.erase) { flush(e, L); e.erase = s.erase; }
     const size_t n = s.pts.size() / 2;
     if (n == 0) return;
@@ -908,9 +1085,11 @@ void rasterStroke(const Stroke& s, size_t& emitted, bool finish, Emitter& e, Lay
             emitted = 1;
         }
     } else {
+        int spans = 0;
         while (emitted + 1 < n) {
             const size_t j = emitted;
             if (!finish && j + 2 >= n) break;      // need one look-ahead point for the tangent
+            if (spans++ >= maxSpans) break;        // live-stroke frame budget: the rest is drawn next frame
             emitCR(e, P(j == 0 ? 0 : j - 1), P(j), P(j + 1), P(std::min(j + 2, n - 1)), r, c);
             emitted++;
             if (e.v.size() >= kFlushVerts) flush(e, L);
@@ -926,22 +1105,142 @@ void drawWhole(const Stroke& s, Emitter& e, LayerGL& L) {
 
 // Redraw one layer from history: only strokes whose drawing (cel) is on screen. A layer with nothing to show
 // gives its texture back, so empty (row, layer) pairs cost no GPU memory.
+// ------------------------------------------------------------------------------------------ raster cache glue
+// The stroke history is the source of truth; fox_celcache.h only remembers each drawing's FINISHED PICTURE so showing a frame is
+// one texture upload instead of replaying every stroke. Any change to a (cel, layer)'s strokes drops its cached picture first.
+
+uint64_t ckey(int cel, int layer) { return ((uint64_t) (uint32_t) cel << 32) | (uint32_t) layer; }
+
+void invalidate(int cel, int layer) {
+    const uint64_t k = ckey(cel, layer);
+    fox::cache::Cache::get().drop(k);
+    g.lastInv[k] = ++g.invSeq;
+}
+
+void histPush(Stroke&& s) {
+    g.inkBy[s.cel][s.layer]++;
+    invalidate(s.cel, s.layer);
+    g.history.push_back(std::move(s));
+}
+
+void inkSub(const Stroke& s) {   // the stroke already left g.history
+    auto it = g.inkBy.find(s.cel);
+    if (it != g.inkBy.end()) {
+        auto j = it->second.find(s.layer);
+        if (j != it->second.end() && --j->second <= 0) it->second.erase(j);
+        if (it->second.empty()) g.inkBy.erase(it);
+    }
+    invalidate(s.cel, s.layer);
+}
+
+// The drawing of native layer [layer] that is on screen (-1 = none). [multi] = more than one shown drawing has ink in it (not cacheable).
+int shownCelOf(int layer, bool* multi) {
+    int found = -1, n = 0;
+    for (int c : g.shown) {
+        auto it = g.inkBy.find(c);
+        if (it != g.inkBy.end() && it->second.count(layer)) { found = c; n++; }
+    }
+    if (multi) *multi = n > 1;
+    return found;
+}
+
+// Collect finished read-backs (PBO + fence) into the cache. [blockOne]: wait for the oldest one (bounds the memory in flight).
+void pollReads(bool blockOne = false) {
+    for (size_t i = 0; i < g.reads.size();) {
+        ReadJob& j = g.reads[i];
+        const GLenum st = glClientWaitSync(j.fence, GL_SYNC_FLUSH_COMMANDS_BIT, blockOne ? 1000000000ull : 0ull);
+        blockOne = false;
+        if (st == GL_TIMEOUT_EXPIRED) { i++; continue; }
+        const size_t n = (size_t) j.w * (size_t) j.h;
+        if (st != GL_WAIT_FAILED) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, j.pbo);
+            const void* src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr) (n * 4), GL_MAP_READ_BIT);
+            if (src) {
+                auto it = g.lastInv.find(j.key);
+                if (!j.dead && (it == g.lastInv.end() || it->second <= j.seq)) {
+                    std::vector<uint32_t> px(n);
+                    std::memcpy(px.data(), src, n * 4);
+                    fox::cache::Cache::get().put(j.key, j.T, j.x, j.y, j.w, j.h, std::move(px));
+                }
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        }
+        glDeleteSync(j.fence);
+        glDeleteBuffers(1, &j.pbo);
+        g.reads.erase(g.reads.begin() + (std::ptrdiff_t) i);
+    }
+}
+
+// Remember what the layer shows before it is overwritten: asynchronous read-back of its content box (PBO) into the cache.
+void snapshotLayer(LayerGL& L) {
+    if (!L.tex || L.cel < 0 || !L.dirty) return;
+    if (g.active && g.active->layer == L.id) return;   // a stroke is still being drawn into it: not a finished picture
+    L.dirty = false;
+    const uint64_t key = ckey(L.cel, L.id);
+    const int x0 = std::clamp(L.bx0, 0, g.T), y0 = std::clamp(L.by0, 0, g.T), x1 = std::clamp(L.bx1, 0, g.T), y1 = std::clamp(L.by1, 0, g.T);
+    if (x1 <= x0 || y1 <= y0) { fox::cache::Cache::get().putEmpty(key, g.T); return; }   // nothing was ever drawn into it
+    while (g.reads.size() >= 6) pollReads(true);
+    ReadJob j;
+    j.key = key; j.seq = g.invSeq; j.T = g.T; j.x = x0; j.y = y0; j.w = x1 - x0; j.h = y1 - y0;
+    glGenBuffers(1, &j.pbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, j.pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr) j.w * j.h * 4, nullptr, GL_STREAM_READ);
+    bindLayer(L);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(j.x, j.y, j.w, j.h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);   // into the PBO: returns at once
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    j.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    g.reads.push_back(j);
+}
+
+// Show a cached drawing: clear the layer, upload its cropped bitmap. false = not cached (caller replays the strokes).
+bool loadRaster(LayerGL& L, int cel) {
+    fox::cache::Raster r;
+    if (!fox::cache::Cache::get().take(ckey(cel, L.id), g.T, r)) return false;
+    const bool has = r.w > 0 && r.h > 0 && r.px;
+    if (has && (r.x < 0 || r.y < 0 || r.x + r.w > g.T || r.y + r.h > g.T || r.px->size() < (size_t) r.w * (size_t) r.h)) return false;
+    clearLayer(L);
+    if (has) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, L.tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, r.px->data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        L.bx0 = r.x; L.by0 = r.y; L.bx1 = r.x + r.w; L.by1 = r.y + r.h;
+    }
+    L.cel = cel;
+    L.dirty = false;
+    return true;
+}
+
+// Make native layer [id] show the drawing the playhead selected: from the cache when possible, else replay its strokes (cel-local).
 void rebuildLayer(int id) {
     LayerGL* p = findLayer(id);
     if (!p) return;
-    bool any = false;
-    for (auto& s : g.history) if (s.layer == id && isShown(s.cel)) { any = true; break; }
-    if (!any) { destroyLayerGL(*p); return; }
+    bool multi = false;
+    const int cel = shownCelOf(id, &multi);
+    if (cel < 0) { destroyLayerGL(*p); return; }
     LayerGL& L = getLayer(id);
+    if (!multi && !(g.active && g.active->layer == id) && loadRaster(L, cel)) return;
     clearLayer(L);
     Emitter& e = g.emit;
     for (auto& s : g.history) if (s.layer == id && isShown(s.cel)) drawWhole(s, e, L);
     flush(e, L);
+    L.cel = multi ? -1 : cel;
+    L.dirty = !multi;   // not in the cache yet: snapshot it when it is replaced
 }
 
 void rebuildAllLayers() {
     for (auto& L : g.layers) rebuildLayer(L.id);
     g.rebuildAll = false;
+}
+
+// A live engine stroke is thrown away: let the Renderer drop its scratch / backup state, then forget the Builder.
+void engineAbort(int layer) {
+    if (!gBld) return;
+    if (LayerGL* p = findLayer(layer)) if (p->fbo) gEng.endStroke(p->fbo);
+    gBld.reset();
 }
 
 // ------------------------------------------------------------------------------------------ commands
@@ -999,6 +1298,25 @@ void applyXf(const Cmd& c) {
     }
 }
 
+// c.i0 = timeline row (-1 = off), c.ids = 4 ints per ghost: cel, timeline frame, side (0 past / 1 future), distance (>= 1),
+// c.pts = opacity, fade, tint amount, past rgb, future rgb.
+void applyOnion(const Cmd& c) {
+    fox::onion::Onion& O = g.onion;
+    O.row = c.i0;
+    O.past.clear();
+    O.future.clear();
+    for (size_t i = 0; i + 4 <= c.ids.size(); i += 4) {
+        fox::onion::Ghost gh;
+        gh.cel = c.ids[i]; gh.frame = c.ids[i + 1]; gh.dist = std::max(1, c.ids[i + 3]);
+        (c.ids[i + 2] == 0 ? O.past : O.future).push_back(gh);
+    }
+    if (c.pts.size() >= 9) {
+        O.prm.opacity = c.pts[0]; O.prm.falloff = c.pts[1]; O.prm.tint = c.pts[2];
+        O.prm.pastCol = glm::vec3(c.pts[3], c.pts[4], c.pts[5]);
+        O.prm.futureCol = glm::vec3(c.pts[6], c.pts[7], c.pts[8]);
+    }
+}
+
 // ------------------------------------------------------------------------------------------ rigs
 
 void destroyRigGL(RigGL& R) {
@@ -1006,6 +1324,12 @@ void destroyRigGL(RigGL& R) {
     if (R.ibo) glDeleteBuffers(1, &R.ibo);
     if (R.vao) glDeleteVertexArrays(1, &R.vao);
     if (R.posTex) glDeleteTextures(1, &R.posTex);
+    if (R.cutVbo) glDeleteBuffers(1, &R.cutVbo);
+    if (R.cutIbo) glDeleteBuffers(1, &R.cutIbo);
+    if (R.cutVao) glDeleteVertexArrays(1, &R.cutVao);
+    R.cutVbo = R.cutIbo = R.cutVao = 0;
+    R.cutOn = false;
+    R.cutCount = 0;
     R.vbo = R.ibo = R.vao = 0;
     R.posTex = 0;
     R.uploaded = false;
@@ -1051,6 +1375,40 @@ void uploadRig(RigGL& R) {
     R.uploaded = true;
 }
 
+// Cut-out path: solve the OUTLINE mesh and upload it as plain textured triangles (uv = rest position). cutOn = false means the
+// row keeps drawing through the grid surface (no outline mesh, no pins, or the row did not ask for it).
+void uploadCut(RigGL& R) {
+    R.cutOn = false;
+    const fox::rig::Rig& G = R.rig;
+    if (!G.cutOut || !G.geo.ok() || G.geo.tri.empty() || G.pins.empty()) return;
+    std::vector<float> pos;
+    if (!fox::rig::outlineShown(G, R.chv.data(), pos)) return;
+    const size_t nV = G.geo.v.size();
+    if (pos.size() != nV * 2) return;
+    R.cutBuf.resize(nV * 4);
+    for (size_t i = 0; i < nV; i++) {
+        R.cutBuf[i * 4] = pos[i * 2]; R.cutBuf[i * 4 + 1] = pos[i * 2 + 1];
+        R.cutBuf[i * 4 + 2] = G.geo.v[i].x; R.cutBuf[i * 4 + 3] = G.geo.v[i].y;
+    }
+    if (!R.cutVao) {
+        glGenVertexArrays(1, &R.cutVao);
+        glGenBuffers(1, &R.cutVbo);
+        glGenBuffers(1, &R.cutIbo);
+        glBindVertexArray(R.cutVao);
+        glBindBuffer(GL_ARRAY_BUFFER, R.cutVbo);
+        glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) 0);
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) (2 * sizeof(float)));
+        std::vector<uint32_t> idx(G.geo.tri.begin(), G.geo.tri.end());
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, R.cutIbo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr) (idx.size() * sizeof(uint32_t)), idx.data(), GL_STATIC_DRAW);
+        glBindVertexArray(0);
+        R.cutCount = (GLsizei) idx.size();
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, R.cutVbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr) (R.cutBuf.size() * sizeof(float)), R.cutBuf.data(), GL_DYNAMIC_DRAW);
+    R.cutOn = R.cutCount > 0;
+}
+
 // Re-evaluate every rigged row's mesh at the current time and push it to the GPU + the UI snapshot.
 void evalRigs() {
     for (size_t r = 0; r < g.rigs.size(); r++) {
@@ -1074,12 +1432,16 @@ void evalRigs() {
         if (R.vao) {
             uploadRig(R);
         }
+        uploadCut(R);
         std::lock_guard<std::mutex> l(gMu);
         if (gPub.size() <= r) gPub.resize(r + 1);
         gPub[r].valid = true;
         gPub[r].grid = R.rig.grid;
         gPub[r].l = R.rig.l; gPub[r].t = R.rig.t; gPub[r].r = R.rig.r; gPub[r].b = R.rig.b;
         gPub[r].verts = R.verts;
+        gPub[r].cutOn = R.cutOn;
+        if (R.cutOn) { gPub[r].cut = R.cutBuf; gPub[r].cutTri = R.rig.geo.tri; }
+        else { gPub[r].cut.clear(); gPub[r].cutTri.clear(); }
     }
 }
 
@@ -1173,6 +1535,8 @@ void applyAttachCmd(const Cmd& c) {
     g.animDirty = true;
 }
 
+std::atomic<bool> gMore{false};   // live stroke still has un-rasterised points: the renderer asks for another frame
+
 void runCommands() {
     std::vector<Cmd> local;
     {
@@ -1186,32 +1550,46 @@ void runCommands() {
         lastOp = (int) c.op;
         switch (c.op) {
             case Op::Begin: {
-                if (g.active) rebuildLayer(g.active->layer);
+                if (g.active) { engineAbort(g.active->layer); rebuildLayer(g.active->layer); }
                 Stroke s;
                 s.cel = c.i0; s.layer = c.i1; s.argb = c.argb; s.size = c.f0; s.erase = c.b;
+                s.prm = std::move(c.prm);
                 g.active = std::move(s);
+                gBld.reset();
+                if (!g.active->prm.empty() && gEngOk) {
+                    fox::brush::Params P;
+                    fox::brush::Params::fromArray(g.active->prm.data(), (int) g.active->prm.size(), P);
+                    gBld = std::make_unique<fox::brush::Builder>();
+                    gBld->begin(P, g.active->argb, (float) g.T / kBrushSpace);
+                }
                 break;
             }
             case Op::Point:
-                if (g.active) { g.active->pts.push_back(c.f0); g.active->pts.push_back(c.f1); }
+                if (g.active) {
+                    g.active->pts.push_back(c.f0); g.active->pts.push_back(c.f1);
+                    if (!g.active->prm.empty()) { g.active->aux.push_back(c.f2); g.active->aux.push_back(c.f3); }
+                }
                 break;
             case Op::End:
                 if (g.active) {
                     LayerGL& L = getLayer(g.active->layer);
-                    rasterStroke(*g.active, g.active->emitted, true, e, L);
+                    rasterStroke(*g.active, g.active->emitted, true, e, L, 1 << 30, gBld.get());
                     flush(e, L);
-                    g.history.push_back(std::move(*g.active));
+                    gBld.reset();
+                    L.cel = g.active->cel; L.dirty = true;
+                    histPush(std::move(*g.active));
                     g.redo.clear();
                     g.active.reset();
                 }
                 break;
             case Op::Cancel:
-                if (g.active) { int l = g.active->layer; g.active.reset(); rebuildLayer(l); }
+                if (g.active) { int l = g.active->layer; engineAbort(l); g.active.reset(); rebuildLayer(l); }
                 break;
             case Op::Undo:
                 if (!g.history.empty()) {
                     Stroke s = std::move(g.history.back());
                     g.history.pop_back();
+                    inkSub(s);
                     const int layer = s.layer;
                     const bool visible = isShown(s.cel);
                     g.redo.push_back(std::move(s));
@@ -1222,12 +1600,14 @@ void runCommands() {
                 if (!g.redo.empty()) {
                     Stroke s = std::move(g.redo.back());
                     g.redo.pop_back();
-                    if (isShown(s.cel)) {
-                        LayerGL& L = getLayer(s.layer);
-                        drawWhole(s, e, L);
+                    histPush(std::move(s));
+                    if (isShown(g.history.back().cel)) {
+                        const Stroke& rs = g.history.back();
+                        LayerGL& L = getLayer(rs.layer);
+                        drawWhole(rs, e, L);
                         flush(e, L);
+                        L.cel = rs.cel; L.dirty = true;
                     }
-                    g.history.push_back(std::move(s));
                 }
                 break;
             case Op::SetShown: {
@@ -1235,9 +1615,10 @@ void runCommands() {
                 // rows that keep showing the same drawing are not touched.
                 std::unordered_set<int> next(c.ids.begin(), c.ids.end());
                 std::unordered_set<int> dirty;
-                for (auto& s : g.history) {
-                    if ((g.shown.count(s.cel) != 0) != (next.count(s.cel) != 0)) dirty.insert(s.layer);
-                }
+                auto layersOf = [&](int cel) { auto it = g.inkBy.find(cel); if (it != g.inkBy.end()) for (auto& kv : it->second) dirty.insert(kv.first); };
+                for (int cel : g.shown) if (!next.count(cel)) layersOf(cel);
+                for (int cel : next) if (!g.shown.count(cel)) layersOf(cel);
+                for (int id : dirty) if (LayerGL* lp = findLayer(id)) snapshotLayer(*lp);   // keep what is leaving, before it is overwritten
                 g.shown = std::move(next);
                 for (int id : dirty) rebuildLayer(id);
                 break;
@@ -1267,20 +1648,28 @@ void runCommands() {
             case Op::SetXf:
                 applyXf(c);
                 break;
+            case Op::SetOnion:
+                applyOnion(c);
+                break;
             case Op::AddStroke: {
                 Stroke s;
                 s.cel = c.i0; s.layer = c.i1; s.argb = c.argb; s.size = c.f0; s.erase = c.b;
                 s.pts = std::move(c.pts);
+                s.prm = std::move(c.prm); s.aux = std::move(c.aux);
                 if (isShown(s.cel)) {
                     LayerGL& L = getLayer(s.layer);
                     drawWhole(s, e, L);
                     flush(e, L);
+                    L.cel = s.cel; L.dirty = true;
                 }
-                g.history.push_back(std::move(s));
+                histPush(std::move(s));
                 break;
             }
             case Op::ResetStrokes:
                 g.history.clear(); g.redo.clear(); g.active.reset();
+                g.inkBy.clear(); g.lastInv.clear();
+                for (auto& rj : g.reads) rj.dead = true;
+                fox::cache::Cache::get().clear();
                 for (auto& L : g.layers) destroyLayerGL(L);
                 break;
             case Op::AddImage: {
@@ -1293,10 +1682,17 @@ void runCommands() {
                     LayerGL& L = getLayer(s.layer);
                     drawWhole(s, e, L);
                     flush(e, L);
+                    L.cel = s.cel; L.dirty = true;
                 }
-                g.history.push_back(std::move(s));
+                histPush(std::move(s));
                 break;
             }
+            case Op::Prefetch:   // streaming: bring these drawings' spilled pictures back into RAM before they are shown
+                for (int cel : c.ids) {
+                    auto it = g.inkBy.find(cel);
+                    if (it != g.inkBy.end()) for (auto& kv : it->second) fox::cache::Cache::get().prefetch(ckey(cel, kv.first));
+                }
+                break;
             case Op::FreeImage:
                 for (int h : c.ids) {
                     auto it = g.imgTex.find(h);
@@ -1307,11 +1703,14 @@ void runCommands() {
     }
     if (lastOp >= 0) glChkOp(lastOp);
     // live stroke: emit whatever arrived this frame, in one batch
+    bool more = false;
     if (g.active) {
         LayerGL& L = getLayer(g.active->layer);
-        rasterStroke(*g.active, g.active->emitted, false, e, L);
+        rasterStroke(*g.active, g.active->emitted, false, e, L, 300, gBld.get());   // <= 300 spans (~10k segments) per frame
         flush(e, L);
+        more = g.active->emitted + 2 < g.active->pts.size() / 2;
     }
+    gMore.store(more, std::memory_order_relaxed);
 }
 
 void push(Cmd&& c) {
@@ -1388,6 +1787,75 @@ void uploadTri(TriGL& G, const TriData& D) {
     glBindVertexArray(0);
 }
 
+// ------------------------------------------------------------------------------------------ onion skin
+// Ghost pictures (fox_onion.h). Replay of a drawing's strokes is the same path rebuildLayer uses, into a scratch layer.
+
+void onionPictures(int cel, const std::function<void(GLuint)>& each) {
+    auto it = g.inkBy.find(cel);
+    if (it == g.inkBy.end()) return;
+    if (!gOnionScratch.tex) createLayerGL(gOnionScratch);
+    Emitter& e = g.emit;
+    for (const LayerGL& real : g.layers) {   // bottom -> top
+        if (!real.visible || !it->second.count(real.id)) continue;
+        clearLayer(gOnionScratch);
+        for (auto& s : g.history) if (s.layer == real.id && s.cel == cel) drawWhole(s, e, gOnionScratch);
+        flush(e, gOnionScratch);
+        each(gOnionScratch.tex);
+    }
+}
+
+void updateOnion() {
+    fox::onion::Onion& O = g.onion;
+    if (!O.on()) {   // off: give the GPU memory back
+        fox::onion::release(O);
+        if (gOnionScratch.tex) destroyLayerGL(gOnionScratch);
+        return;
+    }
+    auto stampOf = [&](int cel) -> uint64_t {   // order independent: changes with the strokes of the drawing and with its layers' visibility
+        auto it = g.inkBy.find(cel);
+        if (it == g.inkBy.end()) return 0;
+        uint64_t s = 1;
+        for (auto& kv : it->second) {
+            const LayerGL* l = findLayer(kv.first);
+            if (l && !l->visible) continue;
+            auto j = g.lastInv.find(ckey(cel, kv.first));
+            s += (j == g.lastInv.end() ? 0u : j->second) * 2654435761ull + (uint64_t) kv.second * 7919ull + (uint64_t) (kv.first + 1) * 104729ull;
+        }
+        return s;
+    };
+    auto modelAt = [&](int frame) -> glm::mat4 {   // the row's pose at the ghost's own frame, in paper-texture px
+        const int r = g.onion.row;
+        if (r < 0 || (size_t) r >= g.rows.size()) return glm::mat4(1.f);
+        const RowAnim& R = g.rows[(size_t) r];
+        const int n = (int) (R.keys.size() / fox::anim::kKeyStride);
+        const fox::anim::Xf x = fox::anim::evalRow(R.keys.data(), n, (float) (frame - R.offset), R.base);
+        return layerMatrix(LayerXf{x.tx, x.ty, x.sx, x.sy, x.rot, x.px, x.py}, (float) g.T);
+    };
+    fox::onion::update(O, gBake, g.T, stampOf, modelAt, onionPictures);
+}
+
+// The two baked pictures, right above the paper and below every layer. Uses the plain layer program (texture * paper clip).
+void drawOnionGhosts(const ViewState& v, const glm::mat4& mvp, float side) {
+    const fox::onion::Onion& O = g.onion;
+    if (!O.on()) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g.W, g.H);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g.layer.p);
+    setQuadUniforms(g.layer, v, mvp, side, 0.f);
+    glUniform1i(g.layer.uTex, 0);
+    const glm::mat4 id(1.f);
+    glUniformMatrix4fv(g.layer.uModel, 1, GL_FALSE, glm::value_ptr(id));
+    glBindVertexArray(0);
+    for (const fox::onion::Side* S : {&O.sidePast, &O.sideFuture}) {
+        if (!S->tex || !S->has) continue;
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, S->tex);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+}
+
 void drawScreen() {
     ViewState v;
     {
@@ -1414,6 +1882,8 @@ void drawScreen() {
     glUniform4fv(g.paper.uCA, 1, glm::value_ptr(ca));
     glUniform4fv(g.paper.uCB, 1, glm::value_ptr(cb));
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    drawOnionGhosts(v, mvp, side);   // onion skin: above the paper, below every layer
 
     const bool posed = gRigPosed.load();
 
@@ -1458,7 +1928,16 @@ void drawScreen() {
         }
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, L.tex);
-        if (rg) {
+        if (rg && rg->cutOn && rg->cutVao && g.cut.p) {
+            // cut-out: the raster is drawn triangle by triangle along the outline mesh (no grid surface, no smear)
+            glUseProgram(g.cut.p);
+            setQuadUniforms(g.cut, v, mvp, side, 0.f);
+            glUniformMatrix4fv(g.cut.uModel, 1, GL_FALSE, glm::value_ptr(lm));
+            glUniform1i(g.cut.uTex, 0);
+            glBindVertexArray(rg->cutVao);
+            glDrawElements(GL_TRIANGLES, rg->cutCount, GL_UNSIGNED_INT, nullptr);
+            glBindVertexArray(0);
+        } else if (rg) {
             glUseProgram(g.mesh.p);
             setQuadUniforms(g.mesh, v, mvp, side, 0.f);
             glUniformMatrix4fv(g.mesh.uModel, 1, GL_FALSE, glm::value_ptr(lm));
@@ -1595,11 +2074,24 @@ void drawScreen() {
                     std::vector<float> sig;
                     if (warp) for (const auto& p : pp) { sig.push_back(p.p.x); sig.push_back(p.p.y); sig.push_back(p.q.x); sig.push_back(p.q.y); }
                     sig.push_back((float) (warp ? g.rigs[r].rig.pinFalloff : 0));
+                    // in-shape pin distances (same field the picture uses, fox::rig::prepareGeo): only when the outline mesh the rig carries IS this mesh
+                    const fox::rig::GeoField* gf = nullptr;
+                    if (warp && g.rigs[r].rig.gf.valid && (size_t) g.rigs[r].rig.gf.nTri == G.rest.size() / 2 &&
+                        (size_t) g.rigs[r].rig.gf.nPins == g.rigs[r].rig.pins.size())
+                        gf = &g.rigs[r].rig.gf;
+                    sig.push_back(gf ? (float) gf->stamp : -1.f);
+                    sig.push_back(g.rigs[r].rig.arapSys ? (float) g.rigs[r].rig.arapSys->stamp : -1.f);
+                    sig.push_back(g.rigs[r].rig.cutOut ? 1.f : 0.f);
                     if (!G.filled || sig != G.sig) {
                         std::vector<float> pos = G.rest;
-                        if (warp) {
+                        std::vector<float> shown;
+                        if (warp && gf && fox::rig::outlineShown(g.rigs[r].rig, g.rigs[r].chv.data(), shown) && shown.size() == pos.size()) {
+                            pos = shown;   // same ARAP / in-shape MLS as the cut-out picture, so lines and picture agree
+                        } else if (warp) {
+                            float pd[fox::rig::kMaxPins];
                             for (size_t i = 0; i + 1 < pos.size(); i += 2) {
-                                const glm::vec2 q = fox::rig::mlsRigid(pp.data(), pp.size(), g.rigs[r].rig.pinFalloff, glm::vec2(G.rest[i], G.rest[i + 1]));
+                                if (gf) for (size_t j = 0; j < g.rigs[r].rig.pins.size(); j++) pd[j] = gf->pinTri[j * (size_t) gf->nTri + i / 2];
+                                const glm::vec2 q = fox::rig::mlsRigid(pp.data(), pp.size(), g.rigs[r].rig.pinFalloff, glm::vec2(G.rest[i], G.rest[i + 1]), gf ? pd : nullptr);
                                 pos[i] = q.x; pos[i + 1] = q.y;
                             }
                         }
@@ -1665,8 +2157,12 @@ void drawScreen() {
 
 FN(void, nativeSurfaceCreated)(JNIEnv*, jclass, jint paperSize) {
     // A new context: every old GL name is gone. Forget handles, keep the stroke history.
-    for (auto& L : g.layers) L.tex = L.fbo = 0;
-    for (auto& R : g.rigs) { R.vao = R.vbo = R.ibo = 0; R.posTex = 0; R.uploaded = false; }   // old context: names are gone
+    for (auto& L : g.layers) { L.tex = L.fbo = 0; L.cel = -1; L.dirty = false; L.bx0 = L.by0 = L.bx1 = L.by1 = 0; }
+    g.reads.clear();   // PBOs / fences belonged to the old context
+    for (auto& R : g.rigs) {   // old context: names are gone (the cut-out buffers too, or a stale VAO would be drawn)
+        R.vao = R.vbo = R.ibo = 0; R.posTex = 0; R.uploaded = false;
+        R.cutVao = R.cutVbo = R.cutIbo = 0; R.cutCount = 0; R.cutOn = false;
+    }
     g.animDirty = true;
 
     GLint maxTex = 2048;
@@ -1680,12 +2176,18 @@ FN(void, nativeSurfaceCreated)(JNIEnv*, jclass, jint paperSize) {
     LOGE("surface: strokeProg=%u uT=%d g@%p", g.strokeProg, (int) g.uT, (void*) &g);
     g.paper.p = linkProgram(kQuadVS, std::string(kPaperFS) + kSdf + kPaperMain);
     g.layer.p = linkProgram(kLayerVS, std::string(kLayerFS) + kSdf + kLayerMain);
+    gBake.p = linkProgram(kLayerVS, fox::onion::kBakeFS);   // onion skin baking (same vertex stage as the layers)
+    fox::onion::locate(gBake);
+    fox::onion::forget(g.onion);   // new GL context: the old ghost pictures are gone (the ghost list stays)
+    gOnionScratch = LayerGL{};
     g.mesh.p = linkProgram(std::string(kMeshVSHead) + kSmoothFn + kMeshVSMain, std::string(kLayerFS) + kSdf + kLayerMain);
     GLC("surfaceCreated: programs linked");
     locate(g.paper);
     locate(g.layer);
     GLC("surfaceCreated: locate paper/layer");
     locate(g.mesh);
+    g.cut.p = linkProgram(kCutVS, std::string(kLayerFS) + kSdf + kLayerMain);
+    locate(g.cut);
     g.wire.p = linkProgram(std::string(kWireVSHead) + kSmoothFn + kWireVSMain, kWireFS);
     locate(g.wire);
     g.wire.uView = glGetUniformLocation(g.wire.p, "uView");
@@ -1705,6 +2207,11 @@ FN(void, nativeSurfaceCreated)(JNIEnv*, jclass, jint paperSize) {
     GLC("surfaceCreated: image program");
     g.fxc.init(0);   // blend / clipping compositor (new context: old names are gone)
     GLC("surfaceCreated: blend compositor init (fxc)");
+    gBld.reset();
+    gEng.forget();   // old context: its names are gone (init() would otherwise delete them in the new one)
+    gEngOk = gEng.init(g.T);
+    if (!gEngOk) LOGE("brush engine: init failed, engine strokes fall back to the classic pen");
+    GLC("surfaceCreated: brush engine init");
 
     glGenVertexArrays(1, &g.vao);
     glGenBuffers(1, &g.vbo);
@@ -1724,6 +2231,27 @@ FN(void, nativeSurfaceCreated)(JNIEnv*, jclass, jint paperSize) {
     g.rebuildAll = true;   // layers are recreated + replayed on the next frame
 }
 
+// Any thread. [dir] = where spilled drawings go (wiped), [ramMb] = RAM budget for compressed drawings.
+FN(void, nativeSetCache)(JNIEnv* env, jclass, jstring dir, jint ramMb) {
+    const char* d = dir ? env->GetStringUTFChars(dir, nullptr) : nullptr;
+    fox::cache::Cache::get().configure(d ? d : "", (size_t) std::max(16, (int) ramMb) << 20);
+    if (d) env->ReleaseStringUTFChars(dir, d);
+}
+
+// Any thread. Drawings the playhead will reach soon: disk -> RAM on the worker thread.
+FN(void, nativePrefetch)(JNIEnv* env, jclass, jintArray cels) {
+    Cmd c;
+    c.op = Op::Prefetch;
+    if (cels) {
+        const jsize n = env->GetArrayLength(cels);
+        c.ids.resize((size_t) n);
+        if (n > 0) env->GetIntArrayRegion(cels, 0, n, reinterpret_cast<jint*>(c.ids.data()));
+    }
+    push(std::move(c));
+}
+
+FN(jboolean, nativeMoreWork)(JNIEnv*, jclass) { return gMore.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE; }
+
 FN(void, nativeSurfaceChanged)(JNIEnv*, jclass, jint w, jint h) {
     g.W = std::max(1, (int) w);
     g.H = std::max(1, (int) h);
@@ -1731,13 +2259,17 @@ FN(void, nativeSurfaceChanged)(JNIEnv*, jclass, jint w, jint h) {
 
 FN(void, nativeDrawFrame)(JNIEnv*, jclass) {
     if (!g.ready) return;
+    pollReads();
     runCommands();
     if (g.animDirty) applyAnim();
     glChk("commands");
     if (g.rebuildAll) rebuildAllLayers();
     glChk("rebuild");
+    updateOnion();   // bake the ghost pictures when a ghost / the settings changed
+    glChk("onion");
     drawScreen();
     glChk("drawScreen");
+    if (!g.reads.empty()) gMore.store(true, std::memory_order_relaxed);   // keep frames coming until the read-backs are collected
 }
 
 // ---- any thread (queued / locked) ----
@@ -1762,6 +2294,34 @@ FN(void, nativeStrokePoint)(JNIEnv*, jclass, jfloat x, jfloat y) {
     push(std::move(c));
 }
 
+static void readFloats(JNIEnv* env, jfloatArray a, std::vector<float>& out) {
+    out.clear();
+    if (!a) return;
+    const jsize n = env->GetArrayLength(a);
+    if (n <= 0) return;
+    out.resize((size_t) n);
+    env->GetFloatArrayRegion(a, 0, n, out.data());
+}
+
+// Brush Studio stroke: [jp] = parameter array (BP layout), non-empty. Points follow as nativeStrokePointEx.
+FN(void, nativeBeginStrokeEx)(JNIEnv* env, jclass, jint cel, jint layer, jint argb, jfloat size, jboolean erase, jfloatArray jp) {
+    Cmd c; c.op = Op::Begin; c.i0 = cel; c.i1 = layer; c.argb = (uint32_t) argb; c.f0 = size; c.b = erase;
+    readFloats(env, jp, c.prm);
+    push(std::move(c));
+}
+
+FN(void, nativeStrokePointEx)(JNIEnv*, jclass, jfloat x, jfloat y, jfloat pressure, jfloat tMs) {
+    Cmd c; c.op = Op::Point; c.f0 = x; c.f1 = y; c.f2 = pressure; c.f3 = tMs;
+    push(std::move(c));
+}
+
+// Replay of a finished engine stroke (project load): xy = points, jaux = (pressure, ms) per point.
+FN(void, nativeAddStrokeEx)(JNIEnv* env, jclass, jint cel, jint layer, jint argb, jfloat size, jboolean erase, jfloatArray jxy, jfloatArray jp, jfloatArray jaux) {
+    Cmd c; c.op = Op::AddStroke; c.i0 = cel; c.i1 = layer; c.argb = (uint32_t) argb; c.f0 = size; c.b = erase;
+    readFloats(env, jxy, c.pts); readFloats(env, jp, c.prm); readFloats(env, jaux, c.aux);
+    push(std::move(c));
+}
+
 FN(void, nativeEndStroke)(JNIEnv*, jclass) { Cmd c; c.op = Op::End; push(std::move(c)); }
 FN(void, nativeCancelStroke)(JNIEnv*, jclass) { Cmd c; c.op = Op::Cancel; push(std::move(c)); }
 FN(void, nativeUndo)(JNIEnv*, jclass) { Cmd c; c.op = Op::Undo; push(std::move(c)); }
@@ -1773,6 +2333,16 @@ FN(void, nativeSetShown)(JNIEnv* env, jclass, jintArray cels) {
     const jsize n = cels ? env->GetArrayLength(cels) : 0;
     c.ids.resize(n);
     if (n) env->GetIntArrayRegion(cels, 0, n, c.ids.data());
+    push(std::move(c));
+}
+
+// Onion skin ghosts of timeline row [row] (-1 = off). ghosts = 4 ints each (cel, frame, side, distance), prm = see applyOnion.
+FN(void, nativeSetOnion)(JNIEnv* env, jclass, jint row, jintArray ghosts, jfloatArray prm) {
+    Cmd c; c.op = Op::SetOnion; c.i0 = row;
+    const jsize n = ghosts ? env->GetArrayLength(ghosts) : 0;
+    c.ids.resize((size_t) n);
+    if (n) env->GetIntArrayRegion(ghosts, 0, n, c.ids.data());
+    readFloats(env, prm, c.pts);
     push(std::move(c));
 }
 
@@ -1967,9 +2537,13 @@ FN(jfloatArray, nativeUnwarp)(JNIEnv* env, jclass, jint row, jfloat x, jfloat y)
         if (row >= 0 && (size_t) row < gPub.size() && gPub[(size_t) row].valid) {
             const PubRig& P = gPub[(size_t) row];
             float u, v;
+            if (P.cutOn) {
+                // cut-out: the picture IS the outline triangles, so invert through them (the grid is not what is on screen)
+                if (unwarpCut(P.cut, P.cutTri, x, y, u, v)) { out[0] = u; out[1] = v; }
+            }
             // exact inverse of what the GPU draws (smooth surface + extension ring); old bilinear inverse as a fallback
-            if (unwarpSurface(P.verts.data(), P.verts.size() / 4, P.grid, P.l, P.t, P.r, P.b, x, y, u, v) ||
-                fox::rig::unwarp(P.verts.data(), P.verts.size() / 4, P.grid, x, y, u, v)) { out[0] = u; out[1] = v; }
+            else if (unwarpSurface(P.verts.data(), P.verts.size() / 4, P.grid, P.l, P.t, P.r, P.b, x, y, u, v) ||
+                     fox::rig::unwarp(P.verts.data(), P.verts.size() / 4, P.grid, x, y, u, v)) { out[0] = u; out[1] = v; }
         }
     }
     jfloatArray r = env->NewFloatArray(2);
@@ -2082,6 +2656,11 @@ FN(jboolean, nativeAddStrokesFromBlob)(JNIEnv* env, jclass, jlong h, jintArray j
             c.f0 = b->sizes[(size_t) i];
             c.b = (m[3] & fox::proj::kFlagErase) != 0;
             c.pts.assign(b->pts.begin() + m[4], b->pts.begin() + m[4] + (size_t) m[5] * 2);
+            if ((m[3] & fox::proj::kFlagEngine) && (size_t) i * fox::proj::kEngStride + 2 < b->eng.size()) {   // Brush Studio stroke
+                const int32_t* en = &b->eng[(size_t) i * fox::proj::kEngStride];
+                c.prm.assign(b->prm.begin() + en[0], b->prm.begin() + en[0] + en[1]);
+                c.aux.assign(b->aux.begin() + en[2], b->aux.begin() + en[2] + (size_t) m[5] * 2);
+            }
         }
         push(std::move(c));
     }

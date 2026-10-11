@@ -37,11 +37,30 @@ fun decodeFitBitmap(ctx: Context, uri: Uri, maxSide: Int = 1024): Bitmap? = runC
     ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
 }.getOrNull()
 
-/** The drawing of [track] (current drawing only when it belongs to the track) as an n x n alpha mask over the layer's paper units. */
-fun EditorState.trackMask(track: Int, n: Int = FIT_N): ByteArray? {
-    val cur = currentCel
-    val ids = HashSet<Int>()
-    if (cur != null && cur.track == track) ids.add(cur.id) else for (c in cels) if (c.track == track) ids.add(c.id)
+/**
+ * The drawing of [track] (current drawing only when it belongs to the track) as an n x n alpha mask over the layer's paper units.
+ * [allCels] = the union of EVERY drawing of the track: the outline mesh needs that, because a cut-out picture shows nothing outside
+ * the mesh, so a frame whose ink reaches beyond the current frame's silhouette would be clipped.
+ */
+fun EditorState.trackMask(track: Int, n: Int = FIT_N, allCels: Boolean = false): ByteArray? {
+    if (!allCels) {
+        val cur = currentCel
+        val ids = HashSet<Int>()
+        if (cur != null && cur.track == track) ids.add(cur.id) else for (c in cels) if (c.track == track) ids.add(c.id)
+        return celMask(ids, n)
+    }
+    var out: ByteArray? = null
+    for (c in cels) {
+        if (c.track != track) continue
+        val m = celMask(hashSetOf(c.id), n) ?: continue
+        val o = out
+        if (o == null) out = m
+        else for (i in o.indices) if ((m[i].toInt() and 255) > (o[i].toInt() and 255)) o[i] = m[i]
+    }
+    return out
+}
+
+private fun EditorState.celMask(ids: Set<Int>, n: Int): ByteArray? {
     val bm = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
     val cv = Canvas(bm)
     val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFFFFF.toInt(); style = Paint.Style.FILL }
@@ -123,6 +142,8 @@ fun EditorState.fitToImage(track: Int, target: Bitmap, shape: FitShape, uniform:
         val o = 5 + i * 4
         pins.add(Pin(out[o], out[o + 1], out[o + 2], out[o + 3]))
     }
+    // cut-out, ARAP and the in-shape pin weights all need the outline mesh of the drawing: build it (silently) the first time
+    if (trackRig(track).outline == null) generateOutlineMesh(track, show = false)
     // the mesh must cover the drawing AND where it ends up (corners of the box stay fixed)
     val b = trackBounds(track)
     val m = 0.05f
@@ -160,22 +181,26 @@ fun EditorState.syncTriMeshes() {
  * Builds a triangle mesh that follows the drawing's outline (dense along the edge, evenly spread inside) and shows it as
  * GPU lines. false = nothing drawn on the track. The old square grid is not drawn for this track any more.
  */
-fun EditorState.generateOutlineMesh(track: Int): Boolean {
+fun EditorState.generateOutlineMesh(track: Int, show: Boolean = true): Boolean {
     val n = 256
-    val mask = trackMask(track, n) ?: return false
+    val mask = trackMask(track, n, allCels = true) ?: return false
     val out = NativeCanvas.genMesh(mask, n, TRI_SPACING[rigUi.triDensity.coerceIn(0, 2)], 3)
     if (out.size < 2) return false
     val nv = out[0].toInt(); val nt = out[1].toInt()
     if (nv < 3 || nt < 1 || out.size < 2 + nv * 2 + nt * 3) return false
-    rigUi.tri[track] = TriMeshData(out.copyOfRange(2, 2 + nv * 2), out.copyOfRange(2 + nv * 2, 2 + nv * 2 + nt * 3))
-    rigUi.meshLines = true
-    syncTriMeshes()
+    val mesh = TriMeshData(out.copyOfRange(2, 2 + nv * 2), out.copyOfRange(2 + nv * 2, 2 + nv * 2 + nt * 3))
+    rigUi.tri[track] = mesh
+    if (show) rigUi.meshLines = true
+    // the rig carries the mesh too: pins then weigh by distance ALONG the drawing (live canvas and movie export alike)
+    setRig(track) { it.copy(outline = mesh) }
+    syncRig()   // also re-sends the display meshes
     return true
 }
 
 fun EditorState.clearOutlineMesh(track: Int) {
     rigUi.tri.remove(track)
-    syncTriMeshes()
+    setRig(track) { it.copy(outline = null) }
+    syncRig()
 }
 
 /**

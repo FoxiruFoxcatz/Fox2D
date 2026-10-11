@@ -13,6 +13,7 @@ import fox.foxiru.foxcat.fox2d.main_canvas.DeformCurve
 import fox.foxiru.foxcat.fox2d.main_canvas.DrawTrack
 import fox.foxiru.foxcat.fox2d.main_canvas.Easing
 import fox.foxiru.foxcat.fox2d.main_canvas.ImagePlace
+import fox.foxiru.foxcat.fox2d.main_canvas.EngineInk
 import fox.foxiru.foxcat.fox2d.main_canvas.InkStroke
 import fox.foxiru.foxcat.fox2d.main_canvas.Layer
 import fox.foxiru.foxcat.fox2d.main_canvas.LayerXf
@@ -21,6 +22,7 @@ import fox.foxiru.foxcat.fox2d.main_canvas.Pin
 import fox.foxiru.foxcat.fox2d.main_canvas.RigLimits
 import fox.foxiru.foxcat.fox2d.main_canvas.Rig
 import fox.foxiru.foxcat.fox2d.main_canvas.TrackGroup
+import fox.foxiru.foxcat.fox2d.main_canvas.TriMeshData
 import fox.foxiru.foxcat.fox2d.main_canvas.WeightPaint
 import fox.foxiru.foxcat.fox2d.timeline.AudioClip
 import fox.foxiru.foxcat.fox2d.timeline.AudioKey
@@ -45,6 +47,7 @@ import java.util.zip.GZIPOutputStream
 internal object ProjectCodec {
     const val VERSION = 1
     private const val STROKE_MAGIC = 0x46325331 // "F2S1"
+    private const val MAX_ENGINE_PARAMS = 64      // == kMaxParams in fox_strokeblob.h
 
     // ------------------------------------------------------------------ json helpers
     private fun fin(v: Float) = (if (v.isFinite()) v else 0f).toDouble()
@@ -107,10 +110,11 @@ internal object ProjectCodec {
         })
         .put("keys", keysJ(r.keys))
         .also { o ->
+            o.put("warp", r.warpFalloff).put("solver", r.warpSolver).put("cut", r.cutOut)
             if (r.pins.isNotEmpty()) {
-                o.put("warp", r.warpFalloff)
-                o.put("pins", JSONArray().also { a -> for (p in r.pins) a.put(floats(p.rx, p.ry, p.dx, p.dy)) })
+                o.put("pins", JSONArray().also { a -> for (p in r.pins) a.put(floats(p.rx, p.ry, p.dx, p.dy, p.rot, p.stiff)) })
             }
+            r.outline?.let { o.put("outline", JSONObject().put("v", blob(it.verts)).put("t", blob(it.tris))) }
             r.paint?.let { o.put("paint", JSONObject().put("verts", it.verts).put("bones", it.bones).put("version", it.version).put("data", blob(it.data))) }
         }
 
@@ -137,10 +141,26 @@ internal object ProjectCodec {
             rect = if (rc != null) MeshRect(rc.f(0), rc.f(1), rc.f(2), rc.f(3)) else MeshRect(),
             keys = keysOf(o.optJSONArray("keys")),
             paint = o.optJSONObject("paint")?.let { WeightPaint(it.getInt("verts"), it.getInt("bones"), unblob(it.getString("data")), it.optInt("version", 0)) },
-            pins = o.optJSONArray("pins")?.let { a -> List(minOf(a.length(), RigLimits.MAX_PINS)) { i -> a.getJSONArray(i).let { t -> Pin(t.f(0), t.f(1), t.f(2), t.f(3)) } } } ?: emptyList(),
+            pins = o.optJSONArray("pins")?.let { a -> List(minOf(a.length(), RigLimits.MAX_PINS)) { i -> a.getJSONArray(i).let { t -> Pin(t.f(0), t.f(1), t.f(2), t.f(3), if (t.length() > 4) t.f(4) else 0f, if (t.length() > 5) t.f(5).coerceIn(0.2f, 4f) else 1f) } } } ?: emptyList(),
             warpFalloff = o.optInt("warp", 2).coerceIn(1, 3),
+            warpSolver = if (o.optInt("solver", 1) == 1) 1 else 0,
+            cutOut = o.optBoolean("cut", true),
+            outline = o.optJSONObject("outline")?.let(::outlineOf),
         )
     }
+
+    /**
+     * Puppet Warp outline mesh. Native indexes the vertex array with these triangle indices unchecked, so they are validated here;
+     * a damaged mesh is dropped (the row falls back to the grid until Generate) instead of failing the whole load.
+     */
+    private fun outlineOf(o: JSONObject): TriMeshData? = runCatching {
+        val v = unblob(o.getString("v")); val t = unblob(o.getString("t"))
+        val nv = v.size / 2
+        if (v.size % 2 != 0 || t.size % 3 != 0 || nv < 3 || t.isEmpty()) return@runCatching null
+        if (v.any { !it.isFinite() }) return@runCatching null
+        if (t.any { !(it >= 0f && it < nv && it == it.toInt().toFloat()) }) return@runCatching null
+        TriMeshData(v, t)
+    }.getOrNull()
 
     // ------------------------------------------------------------------ tracks
     private fun trackJ(t: DrawTrack) = JSONObject()
@@ -181,6 +201,10 @@ internal object ProjectCodec {
         .pf("pxPerSec", p.pxPerSec).pf("scrollPx", p.scrollPx)
         .put("rigMode", p.rigMode).put("boneTool", p.boneTool).put("poseTool", p.poseTool)
         .put("rigShowAll", p.rigShowAll).put("rigAutoKey", p.rigAutoKey)
+        .put("rigCollapsed", p.rigCollapsed).put("rigShowWeights", p.rigShowWeights).put("rigErase", p.rigErase)
+        .pf("rigBrushRadius", p.rigBrushRadius).pf("rigBrushStrength", p.rigBrushStrength)
+        .put("rigMeshLines", p.rigMeshLines)
+        .put("rigTriDensity", p.rigTriDensity).put("rigFitShape", p.rigFitShape).put("rigFitUniform", p.rigFitUniform)
 
     private fun prefsOf(o: JSONObject?): EditorPrefs {
         val d = EditorPrefs()
@@ -199,6 +223,14 @@ internal object ProjectCodec {
             pxPerSec = o.f("pxPerSec", d.pxPerSec), scrollPx = o.f("scrollPx", d.scrollPx),
             rigMode = o.optString("rigMode", d.rigMode), boneTool = o.optString("boneTool", d.boneTool), poseTool = o.optString("poseTool", d.poseTool),
             rigShowAll = o.optBoolean("rigShowAll", d.rigShowAll), rigAutoKey = o.optBoolean("rigAutoKey", d.rigAutoKey),
+            rigCollapsed = o.optBoolean("rigCollapsed", d.rigCollapsed), rigShowWeights = o.optBoolean("rigShowWeights", d.rigShowWeights),
+            rigErase = o.optBoolean("rigErase", d.rigErase),
+            rigBrushRadius = o.f("rigBrushRadius", d.rigBrushRadius).coerceIn(0.01f, 0.3f),
+            rigBrushStrength = o.f("rigBrushStrength", d.rigBrushStrength).coerceIn(0.05f, 1f),
+            rigMeshLines = o.optBoolean("rigMeshLines", d.rigMeshLines),
+            rigTriDensity = o.optInt("rigTriDensity", d.rigTriDensity).coerceIn(0, 2),
+            rigFitShape = o.optInt("rigFitShape", d.rigFitShape).coerceIn(0, 2),
+            rigFitUniform = o.optBoolean("rigFitUniform", d.rigFitUniform),
         )
     }
 
@@ -254,7 +286,11 @@ internal object ProjectCodec {
     fun writeStrokes(out: OutputStream, strokes: List<InkStroke>) {
         val gz = GZIPOutputStream(out)
         val o = DataOutputStream(BufferedOutputStream(gz, 64 * 1024))
-        o.writeInt(STROKE_MAGIC); o.writeInt(2); o.writeInt(strokes.size)
+        // v3 only when a Brush Studio stroke is present, so projects drawn with the classic pen stay readable by older builds
+        fun engineOf(s: InkStroke): EngineInk? =
+            s.engine?.takeIf { s.image == null && it.params.size in 1..MAX_ENGINE_PARAMS && it.aux.size == s.pts.size * 2 }
+        val ver = if (strokes.any { engineOf(it) != null }) 3 else 2
+        o.writeInt(STROKE_MAGIC); o.writeInt(ver); o.writeInt(strokes.size)
         for (s in strokes) {
             o.writeInt(s.cel); o.writeInt(s.layer); o.writeInt(s.color.toArgb()); o.writeFloat(s.size)
             o.writeBoolean(s.erase)
@@ -266,6 +302,15 @@ internal object ProjectCodec {
             } else {
                 o.writeInt(s.pts.size)
                 for (p in s.pts) { o.writeFloat(p.x); o.writeFloat(p.y) }
+                if (ver >= 3) {   // see fox_strokeblob.h: u8 engine, [u16 n, n x float params, pointCount x (pressure, ms)]
+                    val eng = engineOf(s)
+                    o.writeBoolean(eng != null)
+                    if (eng != null) {
+                        o.writeShort(eng.params.size)
+                        for (f in eng.params) o.writeFloat(f)
+                        for (f in eng.aux) o.writeFloat(f)
+                    }
+                }
             }
         }
         o.flush()
@@ -291,7 +336,15 @@ internal object ProjectCodec {
                 require(pc in 0..10_000_000) { "Corrupt point count" }
                 val pts = ArrayList<Offset>(pc)
                 repeat(pc) { pts.add(Offset(i.readFloat(), i.readFloat())) }
-                out.add(InkStroke(cel, layer, Color(argb), size, pts, erase))
+                var engine: EngineInk? = null
+                if (ver >= 3 && i.readBoolean()) {
+                    val np = i.readUnsignedShort()
+                    require(np in 1..MAX_ENGINE_PARAMS) { "Corrupt brush parameters" }
+                    val prm = FloatArray(np) { i.readFloat() }
+                    val aux = FloatArray(pc * 2) { i.readFloat() }
+                    engine = EngineInk(prm, aux)
+                }
+                out.add(InkStroke(cel, layer, Color(argb), size, pts, erase, engine = engine))
             }
         }
         return out

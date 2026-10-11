@@ -77,11 +77,12 @@ private fun nearestDock(c: Offset, w: Float, h: Float): ToolbarDock {
 private class RailGeom { var x = 0; var y = 0; var w = 0; var h = 0; var areaW = 1; var areaH = 1 }
 
 /**
- * Brush / Deform / Bone / Transform / Layers rail, floating over the canvas area.
+ * Brush Studio / Eraser / Colour / Deform / Bone / Warp / Transform / Layers rail, floating over the canvas area.
  * Drag the grip bar to move it: while dragging, the edge it will snap to lights up; on release it docks to
  * that edge (Left / Right = column, Top / Bottom = row) at the spot where you dropped it ([EditorState.railAlong]
- * is the rail's CENTRE as a 0..1 fraction of that edge, so there is no jump on drop). The Brush / Color / Layers
- * panels open on the inner side of the rail, whatever edge it is on.
+ * is the rail's CENTRE as a 0..1 fraction of that edge, so there is no jump on drop). The Color / Layers
+ * panels open on the inner side of the rail, whatever edge it is on. The Brush Studio is NOT hosted here: it is a
+ * full-width dock panel (see the Dock in EditorScreen.kt), the rail only carries its button.
  */
 @Composable
 fun FloatingToolRail(state: EditorState) {
@@ -282,7 +283,7 @@ private fun Axis(col: Boolean, modifier: Modifier = Modifier, content: @Composab
 private val RailBtn = 36.dp
 private val RailChevron = 28.dp
 
-/** [Brush, colour] - fold handle - [Deform, Bone, Puppet Warp pin, Transform, Layers]. */
+/** [Brush Studio, eraser, colour] - fold handle - [Deform, Bone, Puppet Warp pin, Transform, Keys, Layers]. */
 @Composable
 private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
     val cs = MaterialTheme.colorScheme
@@ -298,13 +299,11 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
 
     AnimatedVisibility(open, enter = fadeIn(), exit = fadeOut()) {
         Axis(col, if (col) Modifier.padding(bottom = 2.dp) else Modifier.padding(end = 2.dp)) {
-            ToolBtn(state.brush.ico, state.brush.label, state.tool == Tool.Brush, RailBtn) {
-                // 1st tap selects the tool, tap again opens the brush picker
-                if (state.tool == Tool.Brush) {
-                    state.panel = if (state.panel == Panel.Brush) Panel.None else Panel.Brush
-                } else {
-                    state.tool = Tool.Brush
-                }
+            BrushStudioToolBtn(state, RailBtn)   // BrushUI.kt: selects the Brush tool + opens / closes the Studio dock panel
+            // the old Brush panel's Pen / Eraser chips: the Studio edits one brush, so Pen <-> Eraser lives on the rail
+            val erasing = state.tool == Tool.Brush && state.brush == BrushKind.Eraser
+            ToolBtn(Ico.Eraser, "Eraser", erasing, RailBtn) {
+                if (erasing) state.brush = BrushKind.Pen else { state.tool = Tool.Brush; state.brush = BrushKind.Eraser }
             }
             ColorSizeBtn(state, RailBtn)
         }
@@ -315,7 +314,7 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
             .clip(RoundedCornerShape(14.dp))
             .clickable {
                 state.railOpen = !state.railOpen
-                if (!state.railOpen) state.panel = Panel.None
+                if (!state.railOpen) state.panel = Panel.None   // Color / Layers hang off the rail; the Studio lives in the dock and stays
             }
             .semantics { contentDescription = if (open) "Hide tools" else "Show tools" },
         contentAlignment = Alignment.Center,
@@ -330,6 +329,7 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
             ToolBtn(Ico.Transform, "Transform", state.transformOpen, RailBtn) {
                 if (state.transformOpen) state.transformOpen = false else state.openTransform()
             }
+            KeyGraphToolBtn(state, RailBtn)   // KeyGraphUI.kt: graph / keyframes editor
             ToolBtn(Ico.Layers, "Layers", state.panel == Panel.Layers, RailBtn) {
                 state.panel = if (state.panel == Panel.Layers) Panel.None else Panel.Layers
             }
@@ -337,7 +337,7 @@ private fun RailItems(state: EditorState, col: Boolean, dock: ToolbarDock) {
     }
 }
 
-/** Brush / Color / Layers panels, stacked in one box; they grow out of the rail on whichever side it is. */
+/** Color / Layers panels, stacked in one box; they grow out of the rail on whichever side it is. */
 @Composable
 private fun PanelHost(state: EditorState, dock: ToolbarDock, drag: () -> Offset) {
     val origin = when (dock) {
@@ -350,7 +350,6 @@ private fun PanelHost(state: EditorState, dock: ToolbarDock, drag: () -> Offset)
     val exit = fadeOut() + scaleOut(transformOrigin = origin)
     // panels ride along while the rail is being dragged
     Box(Modifier.graphicsLayer { val d = drag(); translationX = d.x; translationY = d.y }) {
-        AnimatedVisibility(state.panel == Panel.Brush, enter = enter, exit = exit) { BrushPanel(state) }
         AnimatedVisibility(state.panel == Panel.Color, enter = enter, exit = exit) { ColorPanel(state) }
         AnimatedVisibility(state.panel == Panel.Layers, enter = enter, exit = exit) { LayersPanel(state) }
     }

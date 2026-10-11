@@ -111,6 +111,10 @@ fun EditorState.capturePrefs() = EditorPrefs(
     pxPerSec = timeline.pxPerSec, scrollPx = timeline.scrollPx,
     rigMode = rigUi.mode.name, boneTool = rigUi.boneTool.name, poseTool = rigUi.poseTool.name,
     rigShowAll = rigUi.showAll, rigAutoKey = rigUi.autoKey,
+    rigCollapsed = rigUi.collapsed, rigShowWeights = rigUi.showWeights, rigErase = rigUi.erase,
+    rigBrushRadius = rigUi.brushRadius, rigBrushStrength = rigUi.brushStrength,
+    rigMeshLines = rigUi.meshLines,
+    rigTriDensity = rigUi.triDensity, rigFitShape = rigUi.fitShape, rigFitUniform = rigUi.fitUniform,
 )
 
 private fun EditorState.applyPrefs(p: EditorPrefs) {
@@ -124,6 +128,10 @@ private fun EditorState.applyPrefs(p: EditorPrefs) {
     rigUi.mode = parse(p.rigMode, RigMode.Build); rigUi.boneTool = parse(p.boneTool, BoneTool.Draw)
     rigUi.poseTool = parse(p.poseTool, PoseTool.Auto)
     rigUi.showAll = p.rigShowAll; rigUi.autoKey = p.rigAutoKey
+    rigUi.collapsed = p.rigCollapsed; rigUi.showWeights = p.rigShowWeights; rigUi.erase = p.rigErase
+    rigUi.brushRadius = p.rigBrushRadius; rigUi.brushStrength = p.rigBrushStrength
+    rigUi.meshLines = p.rigMeshLines
+    rigUi.triDensity = p.rigTriDensity; rigUi.fitShape = p.rigFitShape; rigUi.fitUniform = p.rigFitUniform
 }
 
 /** Call on the main thread (reads snapshot state). The result is immutable and safe to encode on any thread. */
@@ -173,6 +181,9 @@ suspend fun EditorState.applyProject(ctx: Context, repo: ProjectRepository, data
         timeline.selectedClip = -1
         cels.clear(); cels.addAll(data.cels)
         drawTracks.clear(); drawTracks.addAll(data.drawTracks)
+        // Rig.outline is what gets saved; rigUi.tri is its per-row mirror (Outline mesh row, syncTriMeshes), so rebuild it
+        rigUi.tri.clear()
+        for (t in data.drawTracks) t.rig.outline?.let { rigUi.tri[t.id] = it }
         groups.clear(); groups.addAll(data.groups)
         collapsedGroups.clear(); selectedGroup = -1
         strokes.clear(); strokes.addAll(data.strokes)

@@ -136,7 +136,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.rememberCoroutineScope
 
 enum class Tool { Brush, Deform, Bone, Warp }
-enum class Panel { None, Color, Layers, Brush }
+enum class Panel { None, Color, Layers, Brush /* unused since the Brush Studio (BrushUI.kt) replaced BrushPanel; kept so old references still compile */ }
 
 /** Editor chrome floats over the full-screen canvas; this is how opaque it is. */
 internal const val UI_ALPHA = 0.82f
@@ -290,10 +290,17 @@ private object KeyDerivedCache {
     }
 }
 
+/**
+ * Brush Studio stroke data: [params] = the array it was drawn with (BP layout in BrushUI.kt, the random seed included),
+ * [aux] = (pressure, ms) per point of InkStroke.pts. Together with pts they replay the stroke pixel-identically.
+ */
+class EngineInk(val params: FloatArray, val aux: FloatArray)
+
 data class InkStroke(
     val cel: Int, val layer: Int, val color: Color, val size: Float, val pts: List<Offset>,
     val erase: Boolean = false,
     val image: ImagePlace? = null,        // non-null = imported picture (pts empty)
+    val engine: EngineInk? = null,        // non-null = drawn by the brush engine (strokes.bin v3); null = classic capsule pen
 )
 
 /** blend: index into [FxBlend.names]; opacity 0..1; clip = only visible where the layer / row below it has pixels. */
@@ -488,6 +495,7 @@ class EditorState {
     var transformBoxOnly by mutableStateOf(false)
     var panel by mutableStateOf(Panel.None)
     var propsOpen by mutableStateOf(false)
+    val onion = OnionState()   // onion skin settings (OnionSkin.kt)
     var exportOpen by mutableStateOf(false)
 
     /** Id of the project this state currently holds (set by applyProject); null = none opened yet. */
@@ -1188,6 +1196,16 @@ class EditorState {
     /** Tell native which drawing each row shows now; it redraws only the layers whose drawing changed. */
     fun syncShown() {
         NativeCanvas.setShown(drawTracks.mapNotNull { celAt(frame, it.id)?.shownId() }.toIntArray())
+        // streaming: while playing, native pulls the drawings of the next frames from disk into RAM before the playhead gets there
+        if (playing) {
+            val ahead = HashSet<Int>()
+            for (k in 1..8) {
+                val f = frame + k
+                if (f >= frameCount) break
+                for (t in drawTracks) celAt(f, t.id)?.shownId()?.let { ahead.add(it) }
+            }
+            if (ahead.isNotEmpty()) NativeCanvas.prefetch(ahead.toIntArray())
+        }
     }
 
     /**
@@ -1229,7 +1247,9 @@ class EditorState {
             }
             val xy = FloatArray(st.pts.size * 2)
             for (i in st.pts.indices) { xy[i * 2] = st.pts[i].x; xy[i * 2 + 1] = st.pts[i].y }
-            NativeCanvas.addStroke(st.cel, nativeLayer(track, st.layer), st.color.toArgb(), st.size, st.erase, xy)
+            val eng = st.engine
+            if (eng != null) NativeCanvas.addStrokeEx(st.cel, nativeLayer(track, st.layer), st.color.toArgb(), st.size, st.erase, xy, eng.params, eng.aux)
+            else NativeCanvas.addStroke(st.cel, nativeLayer(track, st.layer), st.color.toArgb(), st.size, st.erase, xy)
             return true
         }
         for (st in strokes) push(st)
@@ -2419,6 +2439,7 @@ fun EditorScreen(
         )
 
         if (state.propsOpen) PropsSheet(state)
+        if (state.onion.open) OnionSheet(state)
         if (state.exportOpen) ExportSheet(state)
     }
 }
@@ -2457,6 +2478,8 @@ private fun TopBar(state: EditorState, modifier: Modifier, leading: @Composable 
         ) {
             FoxIcon(Ico.Export, iconSize = 20.dp)
         }
+        Spacer(Modifier.width(6.dp))
+        OnionButton(state)
         Spacer(Modifier.width(6.dp))
         FilledTonalButton(
             onClick = { state.propsOpen = true },
@@ -2536,15 +2559,23 @@ fun EditorSurface(state: EditorState, pad: PaddingValues) {
     LaunchedEffect(state) {
         snapshotFlow { state.frame }.distinctUntilChanged().collect { state.syncTime() }
     }
+    OnionSync(state)   // ghosts of the neighbouring drawings -> native (OnionSkin.kt)
 
     val listener = remember(state) {
         object : CanvasGestureListener {
             private var strokeCel = -1
             private var strokeTrack = 0
             private var strokeXf = LayerXf()
+            private var strokePrm: FloatArray? = null   // Brush Studio array of the running stroke (null = classic pen)
+            private var aux = FloatArray(1024)           // (pressure, ms) per point, parallel to [live]
+            private var auxN = 0
+            private fun pushAux(pressure: Float, tMs: Float) {
+                if (auxN + 2 > aux.size) aux = aux.copyOf(aux.size * 2)
+                aux[auxN++] = pressure; aux[auxN++] = tMs
+            }
             override fun canDraw() = state.tool == Tool.Brush && state.brush.ready && state.canDrawHere && !state.transformOpen && state.placing == null
             
-            override fun onInkStart(p: Offset) {
+            override fun onInkStart(p: Offset, pressure: Float, tMs: Float) {
                 val cel = state.currentCel ?: return
                 strokeCel = cel.id
                 strokeTrack = cel.track
@@ -2552,23 +2583,31 @@ fun EditorSurface(state: EditorState, pad: PaddingValues) {
                 strokeXf = state.trackXf(cel.track)
                 val q = state.unwarp(cel.track, strokeXf.invert(state.unattach(cel.track, p)))
                 live.clear(); live.add(q)
+                // Brush Studio: a fresh parameter array (+ seed) per stroke, or null = the classic capsule pen
+                strokePrm = state.brushStudioParams()
+                auxN = 0; pushAux(pressure, tMs)
                 NativeCanvas.beginStroke(
                     cel.id, state.nativeLayer(cel.track, state.activeLayer), state.color.toArgb(),
-                    state.brushSize, state.brush == BrushKind.Eraser,
+                    state.brushSize, state.brush == BrushKind.Eraser, strokePrm,
                 )
-                NativeCanvas.strokePoint(q.x, q.y)
+                NativeCanvas.strokePoint(q.x, q.y, pressure, tMs)
             }
-            override fun onInkMove(p: Offset) { val q = state.unwarp(strokeTrack, strokeXf.invert(state.unattach(strokeTrack, p))); live.add(q); NativeCanvas.strokePoint(q.x, q.y) }
+            override fun onInkMove(p: Offset, pressure: Float, tMs: Float) {
+                val q = state.unwarp(strokeTrack, strokeXf.invert(state.unattach(strokeTrack, p)))
+                live.add(q); pushAux(pressure, tMs); NativeCanvas.strokePoint(q.x, q.y, pressure, tMs)
+            }
             override fun onInkEnd() {
                 if (live.isNotEmpty() && strokeCel >= 0) {
                     state.commit(
                         InkStroke(
                             strokeCel, state.activeLayer, state.color, state.brushSize,
                             live.toList(), state.brush == BrushKind.Eraser,
+                            engine = strokePrm?.takeIf { auxN == live.size * 2 }?.let { EngineInk(it, aux.copyOf(auxN)) },
                         )
                     )
                 }
                 live.clear()
+                strokePrm = null; auxN = 0
                 strokeCel = -1
             }
             override fun onInkCancel() { live.clear(); NativeCanvas.cancelStroke() }
@@ -2756,49 +2795,7 @@ private fun BrushChip(b: BrushKind, selected: Boolean, modifier: Modifier, onCli
     }
 }
 
-private val swatches = listOf(
-    0xFF212121, 0xFFFFFFFF, 0xFFEF5350, 0xFFFF7043,
-    0xFFFFCA28, 0xFF66BB6A, 0xFF29B6F6, 0xFFAB47BC,
-).map { Color(it) }
 
-@Composable
-internal fun ColorPanel(state: EditorState) {
-    val cs = MaterialTheme.colorScheme
-    Surface(
-        shape = RoundedCornerShape(24.dp),
-        color = cs.surfaceContainerHigh.copy(alpha = UI_ALPHA),
-        tonalElevation = 4.dp,
-        shadowElevation = 6.dp,
-    ) {
-        Column(Modifier.width(220.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Box(
-                Modifier.fillMaxWidth().height(44.dp).clip(RoundedCornerShape(14.dp)).background(cs.surfaceContainerHighest),
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(Modifier.size((state.brushSize / 64f * 36f + 4f).dp).clip(CircleShape).background(state.color))
-            }
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                swatches.chunked(4).forEach { row ->
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        row.forEach { c ->
-                            Box(
-                                Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(c)
-                                    .border(1.dp, cs.outlineVariant, CircleShape)
-                                    .clickable { state.setColor(c) }
-                            )
-                        }
-                    }
-                }
-            }
-            LabeledSlider("Hue", state.hue, 0f..360f, state.color) { state.hue = it }
-            LabeledSlider("Shade", state.bri, 0.1f..1f, state.color) { state.bri = it }
-            LabeledSlider("Size", state.brushSize, 1f..64f, state.color) { state.brushSize = it }
-        }
-    }
-}
 
 @Composable
 private fun LabeledSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, tint: Color, onChange: (Float) -> Unit) {
@@ -2979,6 +2976,10 @@ private fun Dock(state: EditorState, modifier: Modifier) {
     val cs = MaterialTheme.colorScheme
     var menuOpen by remember { mutableStateOf(false) }
     LaunchedEffect(state.editMenuTick) { if (state.editMenuTick > 0) menuOpen = true }   // "Edit Track" in a row / layer menu
+    // Brush Studio shares the dock with KeyGraph / Transform: close it when one of them, or a rig tool, takes over
+    LaunchedEffect(state.tool, state.transformOpen, state.keyGraph.open) {
+        if (state.tool != Tool.Brush || state.transformOpen || state.keyGraph.open) state.brushStudio.open = false
+    }
     state.fxTarget?.let { FxDialog(state, it) }
     Surface(
         modifier,
@@ -2988,6 +2989,13 @@ private fun Dock(state: EditorState, modifier: Modifier) {
         shadowElevation = 8.dp,
     ) {
         Column {
+        // KeyGraph Editor (KeyGraphUI.kt): sits above the Transform popup / rig panel so its sliders stay usable; replaces transport + timeline
+        AnimatedVisibility(state.keyGraph.open && state.placing == null, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) { KeyGraphPanel(state) }
+        // Brush Studio (BrushUI.kt): opened from the rail's brush button, docked above the transport like the KeyGraph
+        AnimatedVisibility(
+            state.brushStudio.open && !state.keyGraph.open && !state.transformOpen && state.placing == null,
+            enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically(),
+        ) { BrushStudioPanel(state) }
         // Transform popup takes the place of the player controls + timeline
         AnimatedVisibility(
             state.transformOpen,
@@ -3006,7 +3014,7 @@ private fun Dock(state: EditorState, modifier: Modifier) {
             // bone / deform editor sits above the transport; the timeline below stays usable for scrubbing + key marks
             AnimatedVisibility(state.rigOpen, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) { RigPanel(state) }
             // while bones / curves are being BUILT or weights painted the transport + timeline fold away (the rig panel has undo / redo)
-            AnimatedVisibility(state.rigPosedView, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+            AnimatedVisibility(state.rigPosedView && !state.keyGraph.open, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp),
@@ -3106,7 +3114,7 @@ private fun EditorMenu(state: EditorState, open: Boolean, onDismiss: () -> Unit)
         Section("COMING SOON")
         Item("Bone Construction", wip = true)
         Item("Graph Editor", wip = true)
-        Item("Onion Skin", wip = true)
+        Item(if (state.onion.enabled) "Onion Skin: On" else "Onion Skin: Off") { state.onion.enabled = !state.onion.enabled }
         Item("Export Video", wip = true)
     }
 }

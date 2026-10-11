@@ -35,6 +35,24 @@
 //   corners of the mesh rect are implicit anchors, so a single pin bends its neighbourhood instead of dragging everything.
 //   channels: kPinBase + pin * kPinChans + (0 dx, 1 dy)
 //
+//   SOLVER (pin head slot 1, Rig::warpSolver):  0 = the rigid MLS above (legacy, always available)
+//                                               1 = ARAP on the outline mesh (fox_arap.h): Anderson-accelerated local-global with a
+//                                                   pre-factored sparse Cholesky, started from the MLS solution. It needs the outline
+//                                                   mesh; without one (or when the factorisation fails) the row silently uses MLS.
+//                                               +2 = CUT-OUT (2 = ARAP, 3 = MLS): the picture is no longer sampled through the square grid
+//                                                   (whose weighted blend smears the texture around the pins). The raster is cut along the
+//                                                   outline mesh instead: every outline TRIANGLE is drawn with its own rest-pose texels
+//                                                   (uv = rest position) at the solved position of its three vertices. See outlineShown().
+//   The ARAP displacement of the outline mesh is carried to the rig grid by barycentric lookup and fades to the MLS field outside the shape.
+//
+// SHAPE-AWARE PINS (outline mesh)  - the MLS weights above use IN-SHAPE distance, not straight-line distance
+//   Straight-line distance lets a pin on one arm pull the arm next to it (80 px away on screen, but a whole body away along
+//   the drawing) and makes everything rubber-band between pins. When the row carries an OUTLINE MESH (fox_mesh.h triangles,
+//   appended to the row blob, see kOutlineMagic) every pin gets a geodesic distance field over that mesh (Dijkstra along the
+//   triangle edges). A vertex then only listens to the pins it is CONNECTED to through the drawing; separate limbs, other arms
+//   and loose strokes stay put. No outline mesh -> the old straight-line behaviour. prepare() builds it, so the canvas and the
+//   movie exporter (both call parseRow + prepare + buildMesh) deform identically.
+//
 // ROW BLOB (float stream, see parseRow):
 //   [0] nBones [1] nCurves [2] grid cells per side [3..6] mesh rect l t r b [7] nKeys [8] nPaint [9] nPins
 //   bones  : nBones * kBoneStride   parent hx hy angDeg len radius falloff strength base[8] ikChain ikBend 0 0
@@ -42,10 +60,12 @@
 //   pins   : (only when nPins > 0) kPinHead (falloff 1..3, 0) + nPins * kPinStride (rx ry bdx bdy)
 //   keys   : nKeys * fox::anim::kKeyStride
 //   paint  : nPaint floats (= vertices * bones when valid): weight bias in -1..1
+//   outline: (optional, last) kOutlineMagic nV nT, nV * (x y), nT * (i j k)   outline mesh for shape-aware pins
 // SET BLOB: [nRows, then per row: len, len floats]   (len 0 = row without rig)
 #pragma once
 
 #include "fox_anim.h"
+#include "fox_arap.h"
 
 #include <glm/glm.hpp>
 
@@ -54,6 +74,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <queue>
+#include <utility>
 #include <vector>
 
 namespace fox::rig {
@@ -77,6 +102,8 @@ constexpr int kCurveHead = 8;
 constexpr int kRowHead = 10;
 constexpr int kSamples = 14;   // polyline samples per spline segment (binding + overlay)
 constexpr int kMaxGrid = 128;
+constexpr float kOutlineMagic = 7331.f;   // marks the optional outline-mesh tail of a row blob
+constexpr int kMaxOutlineV = 4000, kMaxOutlineT = 8000;
 
 enum BoneChan : int { DX = 0, DY, ROT, SX, SY, IKX, IKY, IKMIX };
 
@@ -160,6 +187,28 @@ struct Curve {
     std::vector<Ctl> ctl;
 };
 
+// Outline mesh as a graph (vertices + edge lists), for in-shape distances.
+struct Geo {
+    std::vector<glm::vec2> v;
+    std::vector<int> off, to;    // CSR adjacency: edges of vertex i are to[off[i] .. off[i + 1])
+    std::vector<float> len;      // edge lengths, parallel to [to]
+    std::vector<int> tri;        // i j k per triangle (valid, non-degenerate indices only): the ARAP solver works on these
+    uint32_t hash = 0;           // content hash, so unchanged meshes are recognised between blob updates
+    bool ok() const { return v.size() >= 3 && !to.empty(); }
+};
+
+// Per-pin in-shape distances: to every outline vertex (pinTri) and to every grid vertex of the rig mesh (pinGrid).
+struct GeoField {
+    bool valid = false;
+    uint32_t stamp = 0;              // changes whenever the distances change (the overlay refills on it)
+    std::vector<float> key;          // what it was built from (reused while unchanged)
+    int nTri = 0, nPins = 0, nGrid = 0;
+    std::vector<float> pinTri;       // nPins * nTri
+    std::vector<int> nearV;          // per grid vertex: nearest outline vertex
+    std::vector<float> nearD;        // ... and its distance
+    std::vector<float> pinGrid;      // nPins * nGrid
+};
+
 struct Bind {   // per vertex, per curve
     float s = 0.f, w = 0.f, v = 0.f, mask = 0.f;
 };
@@ -172,9 +221,12 @@ struct Rig {
     std::vector<Curve> curves;
     std::vector<Pin> pins;
     int pinFalloff = 2;        // 1 = wide (soft), 2 = medium, 3 = tight
+    int warpSolver = 0;        // 0 = rigid MLS, 1 = ARAP (see the PUPPET WARP notes at the top)
+    bool cutOut = false;       // draw the outline triangles (raster cut along the mesh) instead of the grid surface
     std::vector<float> keys;
     int nKeys = 0;
     std::vector<float> paint;
+    Geo geo;                   // outline mesh (optional)
 
     // ---- derived (prepare) ----
     std::vector<Aff> restW, restInv, restLocal;
@@ -185,6 +237,8 @@ struct Rig {
     std::vector<float> restWt;            // V weight that stays on the rest position
     std::vector<std::vector<Bind>> bind;  // per curve, per vertex
     std::vector<float> bindKey;           // what bind was computed from (reuse while unchanged)
+    GeoField gf;                          // in-shape pin distances (valid only with an outline mesh and pins)
+    std::shared_ptr<const arap::System> arapSys;   // factorised ARAP system (warpSolver 1 + outline mesh + pins), shared between copies
 
     int verts() const { return (grid + 1) * (grid + 1); }
 };
@@ -193,6 +247,48 @@ struct Pose {
     std::vector<std::array<float, kBoneChans>> vals;
     std::vector<Aff> world, skin;
 };
+
+// ------------------------------------------------------------------------------------------ outline mesh graph
+
+// [vx] = x y per vertex, [tr] = i j k per triangle (as floats, the fox_mesh.h layout). Edges are the unique triangle edges.
+inline void geoBuild(Geo& G, const float* vx, size_t nv, const float* tr, size_t nt) {
+    G = Geo{};
+    if (!vx || !tr || nv < 3 || nt < 1) return;
+    uint32_t h = 2166136261u;
+    auto mix = [&](float f) { uint32_t b; std::memcpy(&b, &f, sizeof b); h = (h ^ b) * 16777619u; };
+    G.v.resize(nv);
+    for (size_t i = 0; i < nv; i++) { G.v[i] = glm::vec2(vx[i * 2], vx[i * 2 + 1]); mix(vx[i * 2]); mix(vx[i * 2 + 1]); }
+    std::vector<std::pair<int, int>> e;
+    e.reserve(nt * 3);
+    for (size_t t = 0; t < nt; t++)
+        for (size_t k = 0; k < 3; k++) {
+            const float fa = tr[t * 3 + k], fb = tr[t * 3 + (k + 1) % 3];
+            mix(fa);
+            const int a = (int) fa, b = (int) fb;
+            if (a < 0 || b < 0 || a >= (int) nv || b >= (int) nv || a == b) continue;
+            e.push_back({std::min(a, b), std::max(a, b)});
+        }
+    std::sort(e.begin(), e.end());
+    e.erase(std::unique(e.begin(), e.end()), e.end());
+    G.off.assign(nv + 1, 0);
+    for (const auto& pr : e) { G.off[(size_t) pr.first + 1]++; G.off[(size_t) pr.second + 1]++; }
+    for (size_t i = 0; i < nv; i++) G.off[i + 1] += G.off[i];
+    G.to.resize((size_t) G.off[nv]);
+    G.len.resize(G.to.size());
+    std::vector<int> fill(G.off.begin(), G.off.end() - 1);
+    for (const auto& pr : e) {
+        const glm::vec2 d = G.v[(size_t) pr.first] - G.v[(size_t) pr.second];
+        const float l = std::sqrt(d.x * d.x + d.y * d.y);
+        G.to[(size_t) fill[(size_t) pr.first]] = pr.second; G.len[(size_t) fill[(size_t) pr.first]++] = l;
+        G.to[(size_t) fill[(size_t) pr.second]] = pr.first; G.len[(size_t) fill[(size_t) pr.second]++] = l;
+    }
+    for (size_t t = 0; t < nt; t++) {
+        const int a = (int) tr[t * 3], b = (int) tr[t * 3 + 1], c = (int) tr[t * 3 + 2];
+        if (a < 0 || b < 0 || c < 0 || a >= (int) nv || b >= (int) nv || c >= (int) nv || a == b || b == c || a == c) continue;
+        G.tri.push_back(a); G.tri.push_back(b); G.tri.push_back(c);
+    }
+    G.hash = h;
+}
 
 // ------------------------------------------------------------------------------------------ parsing
 
@@ -251,6 +347,9 @@ inline bool parseRow(const float* d, size_t n, Rig& R) {
     if (nPins > 0) {
         if (o + (size_t) kPinHead + (size_t) nPins * kPinStride > n) return false;
         R.pinFalloff = std::clamp((int) std::lround(d[o]), 1, 3);
+        const int ws = std::clamp((int) std::lround(d[o + 1]), 0, 3);   // bit 0 = solver, bit 1 = cut-out
+        R.warpSolver = ws & 1;
+        R.cutOut = ws >= 2;
         o += kPinHead;
         R.pins.resize((size_t) nPins);
         for (int i = 0; i < nPins; i++, o += kPinStride) {
@@ -267,7 +366,14 @@ inline bool parseRow(const float* d, size_t n, Rig& R) {
     R.nKeys = nKeys;
     o += (size_t) nKeys * fox::anim::kKeyStride;
 
-    if (nPaint > 0 && o + nPaint <= n) R.paint.assign(d + o, d + o + nPaint);
+    if (nPaint > 0 && o + nPaint <= n) { R.paint.assign(d + o, d + o + nPaint); o += nPaint; }
+
+    // optional tail: outline mesh. Anything malformed is ignored (pins then fall back to straight-line distance).
+    if (o + 3 <= n && d[o] == kOutlineMagic) {
+        const int nv = (int) d[o + 1], nt = (int) d[o + 2];
+        if (nv >= 3 && nv <= kMaxOutlineV && nt >= 1 && nt <= kMaxOutlineT && o + 3 + (size_t) nv * 2 + (size_t) nt * 3 <= n)
+            geoBuild(R.geo, d + o + 3, (size_t) nv, d + o + 3 + (size_t) nv * 2, (size_t) nt);
+    }
     R.valid = nB > 0 || nC > 0 || nPins > 0;
     return true;
 }
@@ -457,9 +563,141 @@ inline void prepareMesh(Rig& R, const Rig* prev, bool withCurves) {
     }
 }
 
+// In-shape pin distances. Reused from [prev] while the outline mesh, the grid and the pins' REST positions are unchanged
+// (the pin OFFSETS are not part of it, so dragging a pin never recomputes anything here).
+inline void prepareGeo(Rig& R, const Rig* prev) {
+    GeoField& F = R.gf;
+    F = GeoField{};
+    const Geo& G = R.geo;
+    const size_t V = R.rest.size(), nP = R.pins.size(), nT = G.v.size();
+    if (!G.ok() || nP == 0 || V == 0) return;
+
+    std::vector<float> key = {(float) (G.hash & 0xffffu), (float) (G.hash >> 16), (float) nT, (float) R.grid, R.l, R.t, R.r, R.b, (float) nP};
+    for (const Pin& P : R.pins) { key.push_back(P.rest.x); key.push_back(P.rest.y); }
+    if (prev && prev->gf.valid && prev->gf.key == key) { F = prev->gf; return; }
+
+    constexpr float INF = 1e30f;
+    // spatial buckets of the outline vertices (nearest-vertex queries)
+    const float cell = 0.05f;
+    const int nb = (int) std::ceil(1.f / cell) + 1;
+    std::vector<std::vector<int>> bucket((size_t) nb * (size_t) nb);
+    auto cellOf = [&](float x) { return std::clamp((int) (x / cell), 0, nb - 1); };
+    for (size_t i = 0; i < nT; i++) bucket[(size_t) cellOf(G.v[i].y) * (size_t) nb + (size_t) cellOf(G.v[i].x)].push_back((int) i);
+    auto nearest = [&](glm::vec2 p, float& dist) -> int {
+        const int cx = cellOf(p.x), cy = cellOf(p.y);
+        int best = -1;
+        float b2 = INF;
+        for (int r = 0; r < nb; r++) {
+            for (int dy = -r; dy <= r; dy++)
+                for (int dx = -r; dx <= r; dx++) {
+                    if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
+                    const int x = cx + dx, y = cy + dy;
+                    if (x < 0 || y < 0 || x >= nb || y >= nb) continue;
+                    for (int id : bucket[(size_t) y * (size_t) nb + (size_t) x]) {
+                        const glm::vec2 e = G.v[(size_t) id] - p;
+                        const float d2 = e.x * e.x + e.y * e.y;
+                        if (d2 < b2) { b2 = d2; best = id; }
+                    }
+                }
+            if (best >= 0 && b2 <= (float) r * cell * ((float) r * cell)) break;   // nothing in a farther ring can beat it
+        }
+        dist = best >= 0 ? std::sqrt(b2) : INF;
+        return best;
+    };
+
+    F.nearV.resize(V);
+    F.nearD.resize(V);
+    for (size_t v = 0; v < V; v++) F.nearV[v] = nearest(R.rest[v], F.nearD[v]);
+
+    // Dijkstra from every pin over the outline edges. Seeds: the 3 outline vertices closest to the pin (it may sit a hair off the mesh).
+    F.pinTri.assign(nP * nT, INF);
+    for (size_t i = 0; i < nP; i++) {
+        float* D = &F.pinTri[i * nT];
+        float sd[3] = {INF, INF, INF};
+        int si[3] = {-1, -1, -1};
+        for (size_t v = 0; v < nT; v++) {
+            const glm::vec2 e = G.v[v] - R.pins[i].rest;
+            const float d2 = e.x * e.x + e.y * e.y;
+            int m = 0;
+            for (int k = 1; k < 3; k++) if (sd[k] > sd[m]) m = k;
+            if (d2 < sd[m]) { sd[m] = d2; si[m] = (int) v; }
+        }
+        using QE = std::pair<float, int>;
+        std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
+        for (int k = 0; k < 3; k++)
+            if (si[k] >= 0) { D[si[k]] = std::sqrt(sd[k]); pq.push({D[si[k]], si[k]}); }
+        while (!pq.empty()) {
+            const QE top = pq.top();
+            pq.pop();
+            const int u = top.second;
+            if (top.first > D[u]) continue;
+            for (int k = G.off[(size_t) u]; k < G.off[(size_t) u + 1]; k++) {
+                const int w = G.to[(size_t) k];
+                const float nd = top.first + G.len[(size_t) k];
+                if (nd < D[w]) { D[w] = nd; pq.push({nd, w}); }
+            }
+        }
+    }
+
+    // pin -> grid vertex: through the nearest outline vertex; never shorter than the straight line. A vertex the pin cannot reach
+    // through the drawing (another piece, empty paper) is "far": straight line + 2 paper units.
+    F.pinGrid.resize(nP * V);
+    for (size_t i = 0; i < nP; i++) {
+        const float* D = &F.pinTri[i * nT];
+        for (size_t v = 0; v < V; v++) {
+            const glm::vec2 e = R.rest[v] - R.pins[i].rest;
+            const float eu = std::sqrt(e.x * e.x + e.y * e.y);
+            const int nv = F.nearV[v];
+            const bool reach = nv >= 0 && D[nv] < INF * 0.5f;
+            F.pinGrid[i * V + v] = reach ? std::max(eu, D[nv] + F.nearD[v]) : eu + 2.f;
+        }
+    }
+    F.key = std::move(key);
+    F.nTri = (int) nT; F.nPins = (int) nP; F.nGrid = (int) V;
+    F.stamp = (prev ? prev->gf.stamp : 0u) + 1u;
+    F.valid = true;
+}
+
+// Radius (paper units) over which a pin's Influence changes the rigidity of the triangles around it; follows the Reach chip.
+inline float arapReach(int falloff) { return falloff <= 1 ? 0.30f : falloff == 2 ? 0.18f : 0.10f; }
+
+// Factorises the ARAP system. Reused from [prev] while the outline mesh, the grid, the pins' REST positions, their influence and
+// the reach are unchanged (dragging a pin to a new OFFSET never gets here: the matrix does not depend on it).
+inline void prepareArap(Rig& R, const Rig* prev) {
+    R.arapSys.reset();
+    if (R.warpSolver != 1 || !R.geo.ok() || R.geo.tri.empty() || R.pins.empty() || !R.gf.valid || R.rest.empty()) return;
+    std::vector<float> key = R.gf.key;   // outline hash, grid, rect, pin rests
+    key.push_back(7.f);                    // solver layout version
+    key.push_back((float) R.pinFalloff);
+    for (const Pin& P : R.pins) key.push_back(P.stiff);
+    if (prev && prev->arapSys && prev->arapSys->key == key) { R.arapSys = prev->arapSys; return; }
+
+    const size_t nT = R.geo.v.size(), nP = R.pins.size(), V = R.rest.size();
+    std::vector<float> ov(nT * 2), pr(nP * 2), ps(nP), gr(V * 2);
+    for (size_t i = 0; i < nT; i++) { ov[i * 2] = R.geo.v[i].x; ov[i * 2 + 1] = R.geo.v[i].y; }
+    for (size_t i = 0; i < nP; i++) { pr[i * 2] = R.pins[i].rest.x; pr[i * 2 + 1] = R.pins[i].rest.y; ps[i] = R.pins[i].stiff; }
+    for (size_t i = 0; i < V; i++) { gr[i * 2] = R.rest[i].x; gr[i * 2 + 1] = R.rest[i].y; }
+    arap::BuildIn in;
+    in.nv = (int) nT; in.v = ov.data();
+    in.nt = (int) (R.geo.tri.size() / 3); in.tri = R.geo.tri.data();
+    in.nPins = (int) nP; in.pinRest = pr.data(); in.pinStiff = ps.data();
+    in.pinDist = (R.gf.nTri == (int) nT && R.gf.nPins == (int) nP) ? R.gf.pinTri.data() : nullptr;
+    in.reach = arapReach(R.pinFalloff);
+    in.nGrid = (int) V; in.gridRest = gr.data();
+    std::shared_ptr<arap::System> S = arap::build(in);
+    if (!S || !S->ok) return;
+    uint32_t h = 2166136261u;
+    for (float f : key) { uint32_t b; std::memcpy(&b, &f, sizeof b); h = (h ^ b) * 16777619u; }
+    S->key = std::move(key);
+    S->stamp = h & 0xffffffu;
+    R.arapSys = S;
+}
+
 inline void prepare(Rig& R, const Rig* prev = nullptr, bool withCurves = true) {
     prepareBones(R);
     prepareMesh(R, prev, withCurves);
+    prepareGeo(R, prev);
+    prepareArap(R, prev);
 }
 
 // ------------------------------------------------------------------------------------------ pose
@@ -610,26 +848,31 @@ inline void smoothDisplacement(int grid, std::vector<float>& out) {
 
 // ------------------------------------------------------------------------------------------ puppet warp (pins)
 
-struct PinPt { glm::vec2 p, q; float k = 1.f; };   // rest, posed, influence
+struct PinPt { glm::vec2 p, q; float k = 1.f; int own = -1; };   // rest, posed, influence, index of the pin it belongs to (-1 = mesh corner)
 
 // Rigid Moving Least Squares at [v]: weights w_i = 1 / |p_i - v|^(2 falloff); the weighted centroids give the translation and
 // the weighted Procrustes angle the rotation (angle from p-hat to q-hat). Interpolates: v on a pin returns that pin's q.
-inline glm::vec2 mlsRigid(const PinPt* pp, size_t n, int falloff, glm::vec2 v) {
+//
+// [pinDist] (optional) = in-shape distance from v to each PIN (indexed by PinPt::own, see GeoField). With it a pin is weighted by how far
+// it is ALONG the drawing, so limbs that are only near it in a straight line stay out of its pull. Corners keep the straight line.
+inline glm::vec2 mlsRigid(const PinPt* pp, size_t n, int falloff, glm::vec2 v, const float* pinDist = nullptr) {
     float w[kMaxPins * 4 + 8];   // pins + 3 rotation helpers per pin + corners
     float sw = 0.f;
     // Weights 1/d^(2f) reach 1e27+ next to a pin: squaring them overflows float. So work with the nearest pin's distance as unit:
     // w_i = (dmin2 / d2_i)^f in 0..1, which is the same field up to one constant factor.
     float dmin2 = 1e30f;
+    float dd2[kMaxPins * 4 + 8];   // effective squared distance of every entry
     for (size_t i = 0; i < n; i++) {
         const glm::vec2 dl = pp[i].p - v;
-        const float d2 = dl.x * dl.x + dl.y * dl.y;
+        float d2 = dl.x * dl.x + dl.y * dl.y;
         if (d2 < 1e-8f) return pp[i].q;
+        if (pinDist && pp[i].own >= 0) d2 = std::max(d2, pinDist[pp[i].own] * pinDist[pp[i].own]);
+        dd2[i] = d2;
         dmin2 = std::min(dmin2, d2);
     }
     glm::vec2 ps(0.f), qs(0.f);
     for (size_t i = 0; i < n; i++) {
-        const glm::vec2 dl = pp[i].p - v;
-        const float d2 = dl.x * dl.x + dl.y * dl.y;
+        const float d2 = dd2[i];
         const float r = dmin2 / d2;
         float wi = r;
         for (int k = 1; k < falloff; k++) wi *= r;
@@ -666,20 +909,96 @@ inline bool buildPinPts(const Rig& R, const float* chv, std::vector<PinPt>& out)
         const float k = R.pins[i].stiff;
         const glm::vec2 p = R.pins[i].rest, q = p + d;
         if (std::fabs(d.x) > 1e-7f || std::fabs(d.y) > 1e-7f) moved = true;
-        out.push_back({p, q, k});
+        out.push_back({p, q, k, (int) i});
         if (std::fabs(rotDeg) > 1e-4f) {
             moved = true;
             const float a = rotDeg * 0.017453292519943295f, c = std::cos(a), s = std::sin(a);
             for (int j = 0; j < 3; j++) {
                 const float ang = 1.5707963f + 2.0943951f * (float) j;
                 const glm::vec2 u(std::cos(ang) * kPinSatRadius, std::sin(ang) * kPinSatRadius);
-                out.push_back({p + u, q + glm::vec2(c * u.x - s * u.y, s * u.x + c * u.y), k});
+                out.push_back({p + u, q + glm::vec2(c * u.x - s * u.y, s * u.x + c * u.y), k, (int) i});
             }
         }
     }
     if (!moved) { out.clear(); return false; }
     const glm::vec2 corners[4] = {{R.l, R.t}, {R.r, R.t}, {R.l, R.b}, {R.r, R.b}};
     for (const glm::vec2& c : corners) out.push_back({c, c, 1.f});
+    return true;
+}
+
+// ARAP displacement (xy per OUTLINE vertex) for the current pin state. The start is the in-shape MLS solution, so the result is a pure
+// function of the pose. false = ARAP not available for this rig (the caller keeps using MLS).
+inline bool arapDisplacements(const Rig& R, const float* chv, const std::vector<PinPt>& pinPts, std::vector<float>& D, arap::Stats* st = nullptr,
+                              const arap::Opts& opt = arap::Opts()) {
+    const arap::System* S = R.arapSys.get();
+    const size_t nP = R.pins.size();
+    if (!S || !S->ok || !R.gf.valid || nP == 0 || nP > (size_t) kMaxPins || S->nPins != (int) nP || S->nv != R.gf.nTri || (size_t) S->nv != R.geo.v.size() ||
+        S->nGrid != (int) R.rest.size())
+        return false;
+    const size_t nT = (size_t) S->nv;
+    float ps[kMaxPins * 3];
+    for (size_t j = 0; j < nP; j++) {
+        ps[j * 3] = chv[(size_t) kPinBase + j * kPinChans];
+        ps[j * 3 + 1] = chv[(size_t) kPinBase + j * kPinChans + 1];
+        ps[j * 3 + 2] = chv[(size_t) kPinRotBase + j];
+    }
+    // small moves: one stage from the in-shape MLS solution; big moves are continued from rest inside the solver (see arap::solve)
+    std::vector<float> x0;
+    if (arap::stepCount(*S, ps, opt) == 1) {
+        x0.resize(nT * 2);
+        float pd[kMaxPins];
+        for (size_t i = 0; i < nT; i++) {
+            for (size_t j = 0; j < nP; j++) {
+                float d = R.gf.pinTri[j * nT + i];
+                if (d >= 1e29f) { const glm::vec2 e = R.geo.v[i] - R.pins[j].rest; d = std::sqrt(e.x * e.x + e.y * e.y) + 2.f; }   // unreachable: "far", as in pinGrid
+                pd[j] = d;
+            }
+            const glm::vec2 q = mlsRigid(pinPts.data(), pinPts.size(), R.pinFalloff, R.geo.v[i], pd);
+            x0[i * 2] = q.x; x0[i * 2 + 1] = q.y;
+        }
+    }
+    return arap::solve(*S, ps, x0.empty() ? nullptr : x0.data(), D, opt, st);
+}
+
+// Shown positions of the OUTLINE mesh vertices (xy each) with the pins applied, for the editor's mesh-lines view. false = use the MLS.
+inline bool warpOutline(const Rig& R, const float* chv, std::vector<float>& pos) {
+    std::vector<PinPt> pp;
+    if (!R.arapSys || !buildPinPts(R, chv, pp)) return false;
+    std::vector<float> D;
+    if (!arapDisplacements(R, chv, pp, D)) return false;
+    pos.resize(D.size());
+    for (size_t i = 0; i < R.geo.v.size(); i++) { pos[i * 2] = R.geo.v[i].x + D[i * 2]; pos[i * 2 + 1] = R.geo.v[i].y + D[i * 2 + 1]; }
+    return true;
+}
+
+// CUT-OUT: shown position (xy each) of every OUTLINE-mesh vertex. Same solver as the picture used to get through the grid
+// (ARAP when the row has it, else the in-shape MLS), but evaluated ON the triangles, so no weight has to be blended across
+// empty paper and the texture of a triangle is never stretched by its neighbours: the triangle only moves / rotates with
+// its three vertices. At rest (no pin moved) it returns the rest positions. false = no outline mesh or no pins.
+inline bool outlineShown(const Rig& R, const float* chv, std::vector<float>& pos) {
+    if (!R.geo.ok() || R.geo.tri.empty() || R.pins.empty()) return false;
+    const size_t nT = R.geo.v.size(), nP = R.pins.size();
+    pos.resize(nT * 2);
+    for (size_t i = 0; i < nT; i++) { pos[i * 2] = R.geo.v[i].x; pos[i * 2 + 1] = R.geo.v[i].y; }
+    std::vector<PinPt> pp;
+    if (!buildPinPts(R, chv, pp)) return true;   // nothing moved: rest pose
+    std::vector<float> D;
+    if (R.arapSys && arapDisplacements(R, chv, pp, D) && D.size() == nT * 2) {
+        for (size_t i = 0; i < nT * 2; i++) pos[i] += D[i];
+        return true;
+    }
+    const bool geo = R.gf.valid && (size_t) R.gf.nTri == nT && (size_t) R.gf.nPins == nP && nP <= (size_t) kMaxPins;
+    float pd[kMaxPins];
+    for (size_t i = 0; i < nT; i++) {
+        if (geo)
+            for (size_t j = 0; j < nP; j++) {
+                float d = R.gf.pinTri[j * nT + i];
+                if (d >= 1e29f) { const glm::vec2 e = R.geo.v[i] - R.pins[j].rest; d = std::sqrt(e.x * e.x + e.y * e.y) + 2.f; }
+                pd[j] = d;
+            }
+        const glm::vec2 q = mlsRigid(pp.data(), pp.size(), R.pinFalloff, R.geo.v[i], geo ? pd : nullptr);
+        if (std::isfinite(q.x) && std::isfinite(q.y)) { pos[i * 2] = q.x; pos[i * 2 + 1] = q.y; }
+    }
     return true;
 }
 
@@ -700,6 +1019,11 @@ inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, P
 
     std::vector<PinPt> pinPts;
     const bool warp = buildPinPts(R, chv, pinPts);
+    // in-shape pin distances (outline mesh); without them pins weigh by straight-line distance as before
+    const bool geo = warp && R.gf.valid && R.gf.nGrid == (int) V && R.gf.nPins == (int) R.pins.size() && R.pins.size() <= (size_t) kMaxPins;
+    float pd[kMaxPins];
+    std::vector<float> arapD;   // ARAP displacement of the outline vertices (when the row uses it)
+    const bool useArap = warp && arapDisplacements(R, chv, pinPts, arapD);
 
     for (size_t v = 0; v < V; v++) {
         const glm::vec2 p = R.rest[v];
@@ -723,7 +1047,17 @@ inline void buildMesh(const Rig& R, const float* chv, std::vector<float>& out, P
             const glm::vec2 q = C + T * B.w + N * (B.v * th);
             pos += (q - pos) * (B.mask * c.mix);
         }
-        if (warp) pos += mlsRigid(pinPts.data(), pinPts.size(), R.pinFalloff, p) - p;   // pins move the REST position; add the offset
+        if (warp) {   // pins move the REST position; add the offset
+            float wa = 0.f;
+            glm::vec2 da(0.f);
+            if (useArap) wa = arap::sample(*R.arapSys, arapD.data(), (int) v, da.x, da.y);
+            glm::vec2 dm(0.f);
+            if (wa < 1.f) {   // outside the shape (or MLS row): the in-shape MLS field
+                if (geo) for (size_t j = 0; j < R.pins.size(); j++) pd[j] = R.gf.pinGrid[j * V + v];
+                dm = mlsRigid(pinPts.data(), pinPts.size(), R.pinFalloff, p, geo ? pd : nullptr) - p;
+            }
+            pos += da * wa + dm * (1.f - wa);
+        }
         // never hand the GPU a NaN / runaway vertex (it would smear the whole canvas): fall back to the rest position
         if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || std::fabs(pos.x - p.x) > 8.f || std::fabs(pos.y - p.y) > 8.f) pos = p;
         out[v * 4] = pos.x; out[v * 4 + 1] = pos.y; out[v * 4 + 2] = p.x; out[v * 4 + 3] = p.y;

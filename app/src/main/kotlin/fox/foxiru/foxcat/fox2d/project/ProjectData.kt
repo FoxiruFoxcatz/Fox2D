@@ -43,9 +43,18 @@ data class EditorPrefs(
     val pxPerSec: Float = 96f, val scrollPx: Float = -24f,
     val rigMode: String = "Build", val boneTool: String = "Draw", val poseTool: String = "Auto",
     val rigShowAll: Boolean = true, val rigAutoKey: Boolean = true,
+    // rig panel options (RigUiState)
+    val rigCollapsed: Boolean = false,
+    val rigShowWeights: Boolean = true, val rigErase: Boolean = false,
+    val rigBrushRadius: Float = 0.08f, val rigBrushStrength: Float = 0.5f,
+    val rigMeshLines: Boolean = false,
+    val rigTriDensity: Int = 1, val rigFitShape: Int = 0, val rigFitUniform: Boolean = false,
 ) {
-    /** Same prefs minus the values that change constantly (playhead, timeline scroll): used to detect "dirty". */
-    fun stable() = copy(frame = 0, scrollPx = 0f)
+    /**
+     * Same prefs minus the values that change constantly (playhead, timeline scroll, weight-brush sliders): used to detect "dirty".
+     * They are still written by the next save, they just never trigger one.
+     */
+    fun stable() = copy(frame = 0, scrollPx = 0f, rigBrushRadius = 0.08f, rigBrushStrength = 0.5f)
 }
 
 /** Immutable copy of everything a project file holds. Built on the main thread, encoded on IO. */

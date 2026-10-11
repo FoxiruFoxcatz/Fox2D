@@ -32,5 +32,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- xCrash viewer. Own process so it survives the crash of the main process;
+             platform theme so the splash theme of the app is not inherited. -->
+        <activity
+            android:name=".CrashActivity"
+            android:exported="false"
+            android:process=":crashui"
+            android:taskAffinity="${applicationId}.crash"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
     </application>
 </manifest>

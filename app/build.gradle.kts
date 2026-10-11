@@ -18,8 +18,8 @@ android {
         applicationId = "fox.foxiru.foxcat.fox2d"
         minSdk = 23
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.5v-alpha"
+        versionCode = 11
+        versionName = "0.6v-alpha"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -88,7 +88,8 @@ android {
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
+                "xcrash-rules.pro",
             )
         }
     }
@@ -194,6 +195,7 @@ dependencies {
     implementation(libs.bouncycastle.bcpkix)
     implementation(libs.reorderable)
     implementation(libs.dagger.hilt.android)
+    implementation(libs.xcrash.android.lib)
     ksp(libs.dagger.hilt.compiler)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)

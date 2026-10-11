@@ -199,8 +199,9 @@ class CanvasViewport {
 interface CanvasGestureListener {
     /** Sampled once per gesture, on the first finger down. */
     fun canDraw(): Boolean
-    fun onInkStart(p: Offset)
-    fun onInkMove(p: Offset)
+    /** [pressure] 0..1 as the device reports it (touch ~ constant); [tMs] = ms since the finger went down. */
+    fun onInkStart(p: Offset, pressure: Float, tMs: Float)
+    fun onInkMove(p: Offset, pressure: Float, tMs: Float)
     fun onInkEnd()
 
     /** Extra touch landed mid-stroke: throw the stroke away. */
@@ -323,11 +324,11 @@ fun Modifier.canvasGestures(viewport: CanvasViewport, listener: CanvasGestureLis
                         if (c != null) {
                             if (!inking && c.pressed && (c.position - down.position).getDistance() > slop) {
                                 inking = true
-                                listener.onInkStart(viewport.toUnit(down.position, size))
+                                listener.onInkStart(viewport.toUnit(down.position, size), down.pressure, 0f)
                             }
                             if (inking) {
-                                for (h in c.historical) listener.onInkMove(viewport.toUnit(h.position, size))
-                                listener.onInkMove(viewport.toUnit(c.position, size))
+                                for (h in c.historical) listener.onInkMove(viewport.toUnit(h.position, size), c.pressure, (h.uptimeMillis - t0).toFloat())
+                                listener.onInkMove(viewport.toUnit(c.position, size), c.pressure, (c.uptimeMillis - t0).toFloat())
                                 c.consume()
                                 if (!c.pressed) {
                                     inking = false

@@ -73,4 +73,30 @@ FN(jfloatArray, nativeImageData)(JNIEnv* env, jclass, jlong h) {
     return a;
 }
 
+// Brush Studio strokes (strokes.bin v3). Per stroke i: eng[3i] = first index in the params array, eng[3i+1] = parameter count,
+// eng[3i+2] = first float in the aux array ((pressure, ms) per point; the stroke has meta[3i...] point-count pairs). {-1, 0, -1} = classic.
+// Only strokes whose meta flags have kFlagEngine (4) use it.
+FN(jintArray, nativeEngMeta)(JNIEnv* env, jclass, jlong h) {
+    auto b = fox::proj::get(h);
+    const jsize n = b ? (jsize) b->eng.size() : 0;
+    jintArray a = env->NewIntArray(n);
+    if (a && n) env->SetIntArrayRegion(a, 0, n, b->eng.data());
+    return a;
+}
+
+FN(jfloatArray, nativeEngParams)(JNIEnv* env, jclass, jlong h) {
+    auto b = fox::proj::get(h);
+    const jsize n = b ? (jsize) b->prm.size() : 0;
+    jfloatArray a = env->NewFloatArray(n);
+    if (a && n) env->SetFloatArrayRegion(a, 0, n, b->prm.data());
+    return a;
+}
+
+// Direct buffer over the aux floats (host byte order), like nativePoints. Valid until nativeRelease; null = none.
+FN(jobject, nativeEngAux)(JNIEnv* env, jclass, jlong h) {
+    auto b = fox::proj::get(h);
+    if (!b || b->aux.empty()) return nullptr;
+    return env->NewDirectByteBuffer(b->aux.data(), (jlong) (b->aux.size() * sizeof(float)));
+}
+
 FN(void, nativeRelease)(JNIEnv*, jclass, jlong h) { fox::proj::drop(h); }

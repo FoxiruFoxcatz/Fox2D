@@ -23,6 +23,7 @@ commonsCompress = "1.28.0"
 gson = "2.14.0"
 ktor = "3.6.0"
 desugarJdkLibs = "2.1.5"
+xcrash = "3.1.0"
 
 
 [plugins]
@@ -76,3 +77,4 @@ ktor-serialization-kotlinx-json = { group = "io.ktor", name = "ktor-serializatio
 ktor-serialization-gson = { group = "io.ktor", name = "ktor-serialization-gson" }
 
 desugar-jdk-libs-nio = { group = "com.android.tools", name = "desugar_jdk_libs_nio", version.ref = "desugarJdkLibs" }
+xcrash-android-lib = { group = "com.iqiyi.xcrash", name = "xcrash-android-lib", version.ref = "xcrash" }
